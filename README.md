@@ -1,13 +1,13 @@
 <p align="center">
-  <img src="docs/logo.svg" alt="Protectme Logo" width="120" height="120">
+  <img src="docs/logo.svg" alt="protectme Logo" width="120" height="120">
 </p>
 
-<h1 align="center">Protectme</h1>
+<h1 align="center">protectme</h1>
 
 <p align="center"><strong>A kernel-level safety interlock for Linux</strong></p>
 
 <p align="center">
-  <em>Protectme doesn't protect your files. It protects you from accidentally destroying them.</em>
+  <em>protectme doesn't protect your files. It protects you from accidentally destroying them.</em>
 </p>
 
 <p align="center">
@@ -23,7 +23,7 @@
 
 ## Philosophy
 
-Protectme is a **kernel-level safety interlock** for Linux. It doesn't manage, modify, recover, or monitor your data. It only vetoes destructive operations on explicitly protected filesystem roots.
+protectme is a **kernel-level safety interlock** for Linux. It doesn't manage, modify, recover, or monitor your data. It only vetoes destructive operations on explicitly protected filesystem roots.
 
 > **"Mày có thể làm mọi thứ với hệ thống. Nhưng nếu operation này phá hủy thứ mày đã đánh dấu bảo vệ, tao sẽ veto nó."**
 
@@ -40,7 +40,7 @@ PROTECTED TREE
 
 ---
 
-## What Protectme Does ✅
+## What protectme Does ✅
 
 | Feature | Status | Description |
 |---------|--------|-------------|
@@ -54,7 +54,7 @@ PROTECTED TREE
 
 ---
 
-## What Protectme Does NOT ❌
+## What protectme Does NOT ❌
 
 | Feature | Reason |
 |---------|--------|
@@ -82,7 +82,7 @@ PROTECTED TREE
                           KERNEL
 ═══════════════════════════════════════════════════════════════
                     ┌─────────────────────┐
-                    │   Protectme LSM     │  ← tiny enforcement
+                    │   protectme LSM     │  ← tiny enforcement
                     │  (BPF-LSM preferred)│
                     └──────────┬──────────┘
                                │
@@ -170,7 +170,7 @@ sudo protectme --daemon
 
 ### P0 Research Question
 
-> *"How does kernel-level Protectme know an operation is starting a destructive traversal of a protected root, while allowing all normal mutation inside that root?"*
+> *"How does kernel-level protectme know an operation is starting a destructive traversal of a protected root, while allowing all normal mutation inside that root?"*
 
 This requires mapping filesystem operations (`unlink`, `rmdir`, `rename`, `link`) to LSM hooks and proving the invariant holds across edge cases (symlinks, hardlinks, bind mounts, rename semantics, mount boundaries, TOCTOU).
 
