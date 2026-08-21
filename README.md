@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/logo.svg" alt="protectme Logo" width="120" height="120">
+  <img src="docs/logo.svg" alt="protectme Logo" width="180" height="180">
 </p>
 
 <h1 align="center">protectme</h1>
@@ -69,16 +69,16 @@ PROTECTED TREE
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        USERSPACE                            │
+┌───────────────────────────────────────────────────────────┐
+│                        USERSPACE                          │
 │  ┌─────────┐    ┌──────────────┐    ┌──────────────────┐  │
 │  │  CLI    │───▶│ Policy File  │───▶│  protectmed      │  │
 │  └─────────┘    │/etc/protectme│    │  (control plane) │  │
-│                 └──────────────┘    └────────┬─────────┘  │
+│                 └──────────────┘    └──────────┬───────┘  │
 └────────────────────────────────────────────────┼──────────┘
                                                  │ policy update
                                                  ▼
-══════════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════
                           KERNEL
 ═══════════════════════════════════════════════════════════════
                     ┌─────────────────────┐
@@ -194,5 +194,5 @@ MIT — use it, audit it, improve it.
 ---
 
 <p align="center">
-  <em>A small tool with the security boundary in the right place.</em>
+  <em>Just a cyber sec man :)).</em>
 </p>
