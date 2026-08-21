@@ -1,9 +1,5 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
-#include <linux/fs.h>
-#include <linux/dcache.h>
-#include <linux/namei.h>
 
 struct event {
     __u64 timestamp;
@@ -11,10 +7,9 @@ struct event {
     __u32 ppid;
     __u32 uid;
     char comm[16];
-    char op[16];
+    char op[8];
     unsigned long parent_ino;
     unsigned long target_ino;
-    char target_name[64];
 };
 
 struct {
@@ -22,44 +17,27 @@ struct {
     __uint(max_entries, 1 << 20);
 } events SEC(".maps");
 
-// Helper to get parent inode of dentry
-static __always_inline unsigned long get_parent_ino(struct dentry *dentry) {
-    struct inode *inode = BPF_CORE_READ(dentry, d_parent, d_inode);
-    return inode ? BPF_CORE_READ(inode, i_ino) : 0;
-}
-
-static __always_inline unsigned long get_target_ino(struct dentry *dentry) {
-    struct inode *inode = BPF_CORE_READ(dentry, d_inode);
-    return inode ? BPF_CORE_READ(inode, i_ino) : 0;
-}
-
-static __always_inline void get_target_name(struct dentry *dentry, char *buf, int sz) {
-    const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
-    bpf_probe_read_kernel_str(buf, sz, name);
-}
-
 SEC("lsm/inode_unlink")
-int observe_unlink(struct inode *dir, struct dentry *dentry) {
+int observe_unlink(void *ctx, struct inode *dir, struct dentry *dentry) {
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) return 0;
 
     e->timestamp = bpf_ktime_get_ns();
     e->pid = bpf_get_current_pid_tgid() >> 32;
-    e->ppid = 0; // would need task_struct walk for ppid
+    e->ppid = 0;
     e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
     __builtin_memcpy(e->op, "unlink", 7);
 
-    e->parent_ino = BPF_CORE_READ(dir, i_ino);
-    e->target_ino = get_target_ino(dentry);
-    get_target_name(dentry, e->target_name, sizeof(e->target_name));
+    e->parent_ino = dir ? dir->i_ino : 0;
+    e->target_ino = dentry && dentry->d_inode ? dentry->d_inode->i_ino : 0;
 
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
 
 SEC("lsm/inode_rmdir")
-int observe_rmdir(struct inode *dir, struct dentry *dentry) {
+int observe_rmdir(void *ctx, struct inode *dir, struct dentry *dentry) {
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) return 0;
 
@@ -70,9 +48,8 @@ int observe_rmdir(struct inode *dir, struct dentry *dentry) {
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
     __builtin_memcpy(e->op, "rmdir", 6);
 
-    e->parent_ino = BPF_CORE_READ(dir, i_ino);
-    e->target_ino = get_target_ino(dentry);
-    get_target_name(dentry, e->target_name, sizeof(e->target_name));
+    e->parent_ino = dir ? dir->i_ino : 0;
+    e->target_ino = dentry && dentry->d_inode ? dentry->d_inode->i_ino : 0;
 
     bpf_ringbuf_submit(e, 0);
     return 0;

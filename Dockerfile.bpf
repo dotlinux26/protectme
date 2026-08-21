@@ -1,0 +1,21 @@
+# Use Fedora which has better BPF development support
+FROM fedora:40
+
+RUN dnf install -y \
+    clang \
+    llvm \
+    libbpf-devel \
+    kernel-devel \
+    kernel-headers \
+    make \
+    git \
+    bpftool \
+    && dnf clean all
+
+WORKDIR /src
+COPY bpf/ .
+
+# Use kernel-devel headers
+RUN KDIR=/usr/src/kernels/$(uname -r) make
+
+CMD ["./loader"]
