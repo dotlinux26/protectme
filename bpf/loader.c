@@ -5,26 +5,49 @@
 #include <signal.h>
 #include <sys/resource.h>
 
+struct event {
+    __u64 timestamp;
+    __u64 seq;
+    __u32 pid;
+    __u32 tgid;
+    __u32 ppid;
+    __u32 uid;
+    __u32 euid;
+    char comm[16];
+    char pcomm[16];
+    char op[8];
+    unsigned long parent_ino;
+    unsigned long target_ino;
+    unsigned short target_mode;
+    unsigned int target_type;
+    unsigned int parent_fsid;
+    unsigned int target_fsid;
+};
+
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
     return vfprintf(stderr, format, args);
 }
-
-struct event {
-    __u64 timestamp;
-    __u32 pid;
-    __u32 ppid;
-    __u32 uid;
-    char comm[16];
-    char op[16];
-    unsigned long parent_ino;
-    unsigned long target_ino;
-    char target_name[64];
-};
 
 static volatile bool exiting = false;
 
 static void sig_handler(int sig) {
     exiting = true;
+}
+
+static void print_event(void *ctx, void *data, size_t size) {
+    struct event *e = data;
+    char type_char = '?';
+    switch (e->target_type) {
+        case 1: type_char = 'R'; break; // DT_REG
+        case 2: type_char = 'D'; break; // DT_DIR
+        case 4: type_char = 'L'; break; // DT_LNK
+        case 6: type_char = 'B'; break; // DT_BLK
+        case 10: type_char = 'S'; break; // DT_SOCK
+    }
+    printf("%-4llu %-6u %-6u %-6u %-6s %-4s 0x%lx 0x%lx %c %o %u %u\n",
+           e->seq, e->pid, e->tgid, e->uid, e->comm, e->op,
+           e->parent_ino, e->target_ino, type_char,
+           e->target_mode, e->parent_fsid, e->target_fsid);
 }
 
 int main(int argc, char **argv) {
@@ -35,7 +58,6 @@ int main(int argc, char **argv) {
 
     libbpf_set_print(libbpf_print_fn);
 
-    // Bump RLIMIT_MEMLOCK
     struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
     setrlimit(RLIMIT_MEMLOCK, &rlim);
 
@@ -59,7 +81,6 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    // Attach
     err = bpf_program__attach(prog_unlink);
     if (err) {
         fprintf(stderr, "Failed to attach unlink: %d\n", err);
@@ -71,7 +92,6 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    // Ring buffer
     int map_fd = bpf_object__find_map_fd_by_name(obj, "events");
     if (map_fd < 0) {
         fprintf(stderr, "Failed to find events map\n");
@@ -79,7 +99,7 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    rb = ring_buffer__new(map_fd, NULL, NULL, NULL);
+    rb = ring_buffer__new(map_fd, print_event, NULL, NULL);
     if (!rb) {
         fprintf(stderr, "Failed to create ring buffer\n");
         err = -1;
@@ -89,8 +109,8 @@ int main(int argc, char **argv) {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    printf("Listening for unlink/rmdir events... Ctrl+C to stop\n");
-    printf("%-16s %-6s %-10s %-10s %s\n", "COMM", "PID", "OP", "PARENT_INO", "TARGET");
+    printf("SEQ  PID     TGID    UID    COMM   OP     PARENT_INO  TARGET_INO  T TYPE MODE  PFSID TFSID\n");
+    printf("---------------------------------------------------------------------------------------------\n");
 
     while (!exiting) {
         err = ring_buffer__poll(rb, 100);
