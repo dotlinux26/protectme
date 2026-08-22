@@ -111,7 +111,8 @@ struct {
 
 #define PM_CTX_MAGIC       0xC0DEC0DE
 #define PM_INODE_SET_MAGIC 0x494E4F44
-#define PM_TX_BEGIN_MAGIC  0x54584247 /* "TXBG" — DEPRECATED transport, run8 */
+#define PM_INODE_DEL_MAGIC 0x44454C49 /* "DELI" — delete inode registration */
+#define PM_TX_BEGIN_MAGIC 0x54584247 /* "TXBG" — DEPRECATED transport, run8 */
 #define PM_TX_CLEAR_MAGIC  0x5458434C /* "TXCL" */
 #define PM_MODE_SET_MAGIC  0x4D4F4445 /* "MODE" */
 #define PM_TX_ATTACH_MAGIC 0x54584154 /* "TXAT" — CAP-01E capability attach */
@@ -276,6 +277,16 @@ int tp_enter_prctl(struct trace_event_raw_sys_enter *ctx) {
                 owner = (__u32)bpf_get_current_uid_gid();
             bpf_map_update_elem(&root_owner, &rid, &owner, BPF_ANY);
         }
+        return 0;
+    }
+    if (op == PM_INODE_DEL_MAGIC) {
+        __u64 dev = BPF_CORE_READ(ctx, args[1]);
+        __u64 ino = BPF_CORE_READ(ctx, args[2]);
+        struct inode_key ik = { .dev = (__u32)dev, .ino = (__u32)ino };
+        bpf_map_delete_elem(&inode_state, &ik);
+        /* Also remove from root_owner map */
+        __u64 rid = ((__u64)(__u32)dev << 32) | (__u32)ino;
+        bpf_map_delete_elem(&root_owner, &rid);
         return 0;
     }
     if (op == PM_TX_BEGIN_MAGIC) {

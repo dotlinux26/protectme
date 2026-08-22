@@ -1,4 +1,3 @@
-#include "commands.h"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -14,35 +13,35 @@
 #include <sys/syscall.h>
 #include <linux/prctl.h>
 #include <cstdint>
+#include <cstring>
+#include <unistd.h>
 
 namespace protectme::cli {
 
 constexpr const char* POLICY_FILE = "/etc/protectme/policy";
 constexpr const char* SOCKET_PATH = "/run/protectme/tx.sock";
 
-// Prctl magic numbers (must match kernel)
-constexpr uint32_t PM_INODE_SET_MAGIC = 0x494E4F44;  // "INOD"
-constexpr uint32_t PM_INODE_DEL_MAGIC = 0x44454C49;  // "DELI"
-constexpr uint32_t PM_MODE_SET_MAGIC  = 0x4D4F4445;  // "MODE"
-constexpr uint32_t PM_TX_REVOKE_MAGIC = 0x52564B45;  // "RVKE"
-constexpr uint32_t CAP_REQ_MAGIC = 0x34424D50;       // "PMB4"
-constexpr uint32_t CAP_REV_MAGIC = 0x34424D35;       // "PMB5"
+// Control plane magic numbers (must match loader)
+constexpr uint32_t CTL_PROTECT_MAGIC   = 0x50525443u; /* "PRTC" */
+constexpr uint32_t CTL_UNPROTECT_MAGIC = 0x55505254u; /* "UPRT" */
+constexpr uint32_t CTL_MODE_MAGIC      = 0x4D4F4445u; /* "MODE" */
+constexpr uint32_t CTL_RELOAD_MAGIC    = 0x52454C44u; /* "RELD" */
 
-struct cap_req {
+struct ctl_req {
     uint32_t magic;
     uint32_t pid;
     uint32_t dev;
     uint32_t ino;
-    uint32_t ttl_ms;
+    uint32_t type;      // TREE=1, FILE=2
+    uint32_t owner_uid;
+    uint32_t mode;
+    uint32_t padding[2];
 };
 
-struct cap_resp {
+struct ctl_resp {
+    int32_t result;
     uint64_t nonce;
 };
-
-static int syscall_prctl(uint32_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
-    return syscall(SYS_prctl, op, a1, a2, a3, a4);
-}
 
 static bool stat_root(const std::string& path, uint32_t* dev, uint32_t* ino) {
     struct stat st;
@@ -68,6 +67,36 @@ static int socket_connect() {
     return fd;
 }
 
+static int send_ctl_req(uint32_t magic, uint32_t dev, uint32_t ino, uint32_t type) {
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if (fd < 0) { perror("socket"); return 1; }
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    strncpy(sa.sun_path, "/run/protectme/tx.sock", sizeof(sa.sun_path) - 1);
+    if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        perror("connect");
+        close(fd);
+        return 1;
+    }
+
+    struct ctl_req req = { magic, static_cast<uint32_t>(getpid()), dev, ino, type, 0, 0, {0, 0} };
+    if (send(fd, &req, sizeof(req), 0) != sizeof(req)) {
+        perror("send");
+        close(fd);
+        return 1;
+    }
+
+    struct ctl_resp resp;
+    ssize_t n = recv(fd, &resp, sizeof(resp), 0);
+    close(fd);
+    if (n != sizeof(resp)) {
+        std::cerr << "Error: no response from daemon\n";
+        return 1;
+    }
+    return resp.result == 0 ? 0 : 1;
+}
+
 int cmd_protect(const std::string& path, const std::string& /*mode_str*/) {
     std::filesystem::path p(path);
     std::string canonical;
@@ -87,7 +116,7 @@ int cmd_protect(const std::string& path, const std::string& /*mode_str*/) {
     // Check if it's a directory or file
     struct stat st;
     stat(canonical.c_str(), &st);
-    const char* type = S_ISDIR(st.st_mode) ? "TREE" : "FILE";
+    uint32_t type = S_ISDIR(st.st_mode) ? 1 : 2;  // 1=TREE, 2=FILE
 
     // Write to policy file (root required)
     std::ofstream policy("/etc/protectme/policy", std::ios::app);
@@ -95,11 +124,14 @@ int cmd_protect(const std::string& path, const std::string& /*mode_str*/) {
         std::cerr << "Error: cannot open policy file (need root?)\n";
         return 1;
     }
-    policy << type << " " << canonical << "\n";
-    std::cout << "Protected: " << canonical << " [" << type << "]\n";
+    const char* type_str = (type == 1) ? "TREE" : "FILE";
+    policy << type_str << " " << canonical << "\n";
+    std::cout << "Protected: " << canonical << " [" << type_str << "]\n";
 
-    // Also register in kernel immediately via prctl
-    syscall_prctl(PM_INODE_SET_MAGIC, dev, ino, 0xFEEDFACE, 0);
+    // Register in kernel via socket
+    if (send_ctl_req(CTL_PROTECT_MAGIC, dev, ino, type) != 0) {
+        return 1;
+    }
     return 0;
 }
 
@@ -151,8 +183,10 @@ int cmd_unprotect(const std::string& path) {
         out << l << "\n";
     }
 
-    // Also unregister in kernel
-    syscall_prctl(PM_INODE_DEL_MAGIC, dev, ino, 0, 0);
+    // Unregister in kernel via socket
+    if (send_ctl_req(CTL_UNPROTECT_MAGIC, dev, ino, 0) != 0) {
+        return 1;
+    }
 
     std::cout << "Unprotected: " << canonical << "\n";
     return 0;
@@ -204,12 +238,11 @@ int cmd_status() {
 }
 
 int cmd_reload() {
-    // Use systemctl reload for systemd-managed daemon
-    if (system("systemctl reload protectmed") != 0) {
-        std::cerr << "Error: failed to reload policy (systemctl reload protectmed)\n";
+    // Reload policy via socket
+    
+    if (send_ctl_req(CTL_RELOAD_MAGIC, 0, 0, 0) != 0) {
         return 1;
     }
-    std::cout << "Policy reload triggered\n";
     return 0;
 }
 

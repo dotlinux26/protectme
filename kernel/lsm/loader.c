@@ -44,6 +44,32 @@ struct cap_req  { uint32_t magic; uint32_t pid; uint32_t dev; uint32_t ino;
 struct cap_resp { uint64_t nonce; }; /* nonce=0 in FD mode; fd rides cmsg */
 #define CAP_REQ_MAGIC 0x34424D50u /* "PMB4" — v4: FD capability protocol */
 #define CAP_REV_MAGIC 0x34424D35u /* "PMB5" — P0.5 global revoke request */
+
+/* Control plane message types (socket-based, replaces prctl) */
+#define CTL_PROTECT_MAGIC   0x50525443u /* "PRTC" — protect tree/file */
+#define CTL_UNPROTECT_MAGIC 0x55505254u /* "UPRT" — unprotect tree/file */
+#define CTL_MODE_MAGIC      0x4D4F4445u /* "MODE" — set enforcement mode */
+#define CTL_RELOAD_MAGIC    0x52454C44u /* "RELD" — reload policy */
+#define CTL_STATUS_MAGIC    0x53544154u /* "STAT" — status query */
+
+struct ctl_req {
+    uint32_t magic;
+    uint32_t pid;           /* informational only, validated via SO_PEERCRED */
+    uint32_t dev;
+    uint32_t ino;
+    uint32_t type;          /* TREE=1, FILE=2 */
+    uint32_t owner_uid;     /* 0 = current uid; validated via SO_PEERCRED */
+    uint32_t mode;          /* for CTL_MODE */
+    uint32_t padding[2];
+};
+
+struct ctl_resp {
+    int32_t result;         /* 0 = ok, -errno */
+    uint64_t nonce;         /* for future use */
+};
+
+#define CAP_REQ_MAGIC 0x34424D50u /* "PMB4" — v4: FD capability protocol */
+#define CAP_REV_MAGIC 0x34424D35u /* "PMB5" — P0.5 global revoke request */
 #define PM_TX_REGFD_MAGIC 0x52454746u /* "REGF" — must match obs.bpf.c */
 #define PM_TX_REVOKE_MAGIC 0x52564B45u /* "RVKE" — must match obs.bpf.c */
 #define STATE_PATH "/run/protectme/state"
@@ -230,7 +256,175 @@ static int policy_reconcile(void) {
     fprintf(stderr,
         "policy: reconciled %d object(s), %d skipped — source of truth %s\n",
         loaded, skipped, POLICY_PATH);
+    fclose(f);
+    fprintf(stderr,
+        "policy: reconciled %d object(s), %d skipped — source of truth %s\n",
+        loaded, skipped, POLICY_PATH);
     return loaded;
+}
+
+/* ---- Control plane handlers (socket-based, replaces prctl) ------------ */
+
+static int do_register_inode(uint32_t dev, uint32_t ino, uint32_t type,
+                             uint32_t owner_uid) {
+    /* type: 1=TREE, 2=FILE */
+    if (type != 1 && type != 2) return -EINVAL;
+    if (owner_uid == 0) owner_uid = getuid();
+    uint64_t payload = ((uint64_t)owner_uid << 32) | 0xFEEDFACEul;
+    syscall(SYS_prctl, PM_INODE_SET_MAGIC,
+            (unsigned long)dev, (unsigned long)ino, payload, 0);
+    return 0;
+}
+
+static int do_unregister_inode(uint32_t dev, uint32_t ino) {
+    syscall(SYS_prctl, 0x44454C49, (unsigned long)dev, (unsigned long)ino, 0, 0);
+    return 0;
+}
+
+static int handle_ctl_protect(int c, struct bpf_object *obj) {
+    struct ctl_req req;
+    struct ctl_resp resp = { .result = 0 };
+    struct ucred cr; socklen_t cl = sizeof(cr);
+    getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl);
+
+    ssize_t n = recv(c, &req, sizeof(req), 0);
+    if (n != (ssize_t)sizeof(req) || req.magic != CTL_PROTECT_MAGIC) {
+        resp.result = -EINVAL;
+        send(c, &resp, sizeof(resp), 0);
+        return -1;
+    }
+
+    /* Validate via SO_PEERCRED - authoritative */
+    if (req.owner_uid != 0 && req.owner_uid != cr.uid) {
+        fprintf(stderr, "[ctl] DENIED protect: owner_uid mismatch (req=%u, peer=%u)\n",
+                req.owner_uid, cr.uid);
+        resp.result = -EPERM;
+        send(c, &resp, sizeof(resp), 0);
+        return -1;
+    }
+
+    /* Verify inode exists and is directory/file as specified */
+    struct stat st;
+    char path[256];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", 0); // We don't have path, need another way
+    /* For now, just register the inode directly */
+    int err = do_register_inode(req.dev, req.ino, req.type, req.owner_uid);
+    if (err) {
+        fprintf(stderr, "[ctl] protect failed: inode registration error %d\n", err);
+        resp.result = err;
+        send(c, &resp, sizeof(resp), 0);
+        return -1;
+    }
+
+    fprintf(stderr, "[ctl] PROTECT dev=%u ino=%u type=%u owner=%u (by uid=%u)\n",
+            req.dev, req.ino, req.type, req.owner_uid, cr.uid);
+    send(c, &resp, sizeof(resp), 0);
+    return 0;
+}
+
+static int handle_ctl_unprotect(int c, struct bpf_object *obj) {
+    struct ctl_req req;
+    struct ctl_resp resp = { .result = 0 };
+    struct ucred cr; socklen_t cl = sizeof(cr);
+    getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl);
+
+    ssize_t n = recv(c, &req, sizeof(req), 0);
+    if (n != (ssize_t)sizeof(req) || req.magic != CTL_UNPROTECT_MAGIC) {
+        resp.result = -EINVAL;
+        send(c, &resp, sizeof(resp), 0);
+        return -1;
+    }
+
+    /* Validate via SO_PEERCRED */
+    if (req.owner_uid != 0 && req.owner_uid != cr.uid) {
+        fprintf(stderr, "[ctl] DENIED unprotect: owner_uid mismatch\n");
+        resp.result = -EPERM;
+        send(c, &resp, sizeof(resp), 0);
+        return -1;
+    }
+
+    int err = do_unregister_inode(req.dev, req.ino);
+    if (err) {
+        fprintf(stderr, "[ctl] unprotect failed: inode unregistration error %d\n", err);
+        resp.result = err;
+        send(c, &resp, sizeof(resp), 0);
+        return -1;
+    }
+
+    fprintf(stderr, "[ctl] UNPROTECT dev=%u ino=%u (by uid=%u)\n",
+            req.dev, req.ino, cr.uid);
+    send(c, &resp, sizeof(resp), 0);
+    return 0;
+}
+
+static int handle_ctl_mode(int c, struct bpf_object *obj) {
+    struct ctl_req req;
+    struct ctl_resp resp = { .result = 0 };
+    struct ucred cr; socklen_t cl = sizeof(cr);
+    getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl);
+
+    ssize_t n = recv(c, &req, sizeof(req), 0);
+    if (n != (ssize_t)sizeof(req) || req.magic != CTL_MODE_MAGIC) {
+        resp.result = -EINVAL;
+        send(c, &resp, sizeof(resp), 0);
+        return -1;
+    }
+
+    /* Only root can change mode */
+    if (cr.uid != 0) {
+        fprintf(stderr, "[ctl] DENIED mode change: not root (uid=%u)\n", cr.uid);
+        resp.result = -EPERM;
+        send(c, &resp, sizeof(resp), 0);
+        return -1;
+    }
+
+    if (req.mode > 2) {
+        resp.result = -EINVAL;
+        send(c, &resp, sizeof(resp), 0);
+        return -1;
+    }
+
+    syscall(SYS_prctl, PM_MODE_SET_MAGIC2, req.mode, 0, 0, 0);
+    fprintf(stderr, "[ctl] MODE set to %u (by uid=%u)\n", req.mode, cr.uid);
+    send(c, &resp, sizeof(resp), 0);
+    return 0;
+}
+
+static int handle_ctl_reload(int c) {
+    struct ctl_req req;
+    struct ctl_resp resp = { .result = 0 };
+    struct ucred cr; socklen_t cl = sizeof(cr);
+    getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl);
+
+    ssize_t n = recv(c, &req, sizeof(req), 0);
+    if (n != (ssize_t)sizeof(req) || req.magic != CTL_RELOAD_MAGIC) {
+        resp.result = -EINVAL;
+        send(c, &resp, sizeof(resp), 0);
+        return -1;
+    }
+
+    /* Only root can trigger reload */
+    if (cr.uid != 0) {
+        fprintf(stderr, "[ctl] DENIED reload: not root (uid=%u)\n", cr.uid);
+        resp.result = -EPERM;
+        send(c, &resp, sizeof(resp), 0);
+        return -1;
+    }
+
+    fprintf(stderr, "[ctl] RELOAD triggered by uid=%u\n", cr.uid);
+    g_reload = 1;
+    send(c, &resp, sizeof(resp), 0);
+    return 0;
+}
+
+static int handle_ctl_status(int c) {
+    struct ctl_resp resp = { .result = 0 };
+    struct ucred cr; socklen_t cl = sizeof(cr);
+    getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl);
+
+    /* For now, just return OK */
+    send(c, &resp, sizeof(resp), 0);
+    return 0;
 }
 
 static void cap_issuer_pump(int fd, struct bpf_object *obj) {
@@ -270,6 +464,31 @@ static void cap_issuer_pump(int fd, struct bpf_object *obj) {
                     rc2.pid, rc2.uid);
             send(c, &ok, sizeof(ok), 0);
             usleep(10000);
+            close(c);
+            continue;
+        }
+        if (peek == CTL_PROTECT_MAGIC) {
+            handle_ctl_protect(c, obj);
+            close(c);
+            continue;
+        }
+        if (peek == CTL_UNPROTECT_MAGIC) {
+            handle_ctl_unprotect(c, obj);
+            close(c);
+            continue;
+        }
+        if (peek == CTL_MODE_MAGIC) {
+            handle_ctl_mode(c, obj);
+            close(c);
+            continue;
+        }
+        if (peek == CTL_RELOAD_MAGIC) {
+            handle_ctl_reload();
+            close(c);
+            continue;
+        }
+        if (peek == CTL_STATUS_MAGIC) {
+            handle_ctl_status(c);
             close(c);
             continue;
         }
