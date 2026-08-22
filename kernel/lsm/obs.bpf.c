@@ -116,17 +116,16 @@ struct {
 #define PM_MODE_SET_MAGIC  0x4D4F4445 /* "MODE" */
 #define PM_TX_ATTACH_MAGIC 0x54584154 /* "TXAT" — CAP-01E capability attach */
 
-/* CAP-01E: kernel-issued capability store. Only the privileged issuer
+/* CAP-01E-v2: kernel-issued capability store. Only the privileged issuer
  * (loader, root) writes entries; clients present a 64-bit nonce via
- * prctl(TXAT). Nonce is SINGLE-USE and TGID-BOUND, so knowing the channel
- * without a valid unguessable nonce grants nothing. This still is not full
- * production authority (issuer policy lives in userspace), but it removes
- * "know magic = authority". */
+ * prctl(TXAT). Nonce is SINGLE-USE, TGID-BOUND, UID-BOUND and EXPIRING.
+ * Knowing the channel without a valid unguessable nonce grants nothing. */
 struct tx_cap {
     __u32 dev;
     __u32 ino;
-    __u32 tgid;   /* intended holder — cross-task replay rejected */
-    __u32 state;
+    __u32 tgid;      /* intended holder — cross-task replay rejected */
+    __u32 owner_uid; /* binder must match issuing peer's uid */
+    __u64 expires_ns; /* monotonic deadline for the ATTACH presentation */
 };
 
 struct {
@@ -135,6 +134,16 @@ struct {
     __type(key, __u64);            /* nonce */
     __type(value, struct tx_cap);
 } tx_caps SEC(".maps");
+
+/* CAP-01E-v2 issuer policy input: which uid registered (owns) each
+ * protected root. Written by PM_INODE_SET; read by the USERSPACE issuer
+ * via bpf_map_lookup on the fd — BPF side only stores it here. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 128);
+    __type(key, __u64);   /* (dev<<32)|ino */
+    __type(value, __u32); /* owner uid */
+} root_owner SEC(".maps");
 
 #ifndef EPERM
 #define EPERM 1
@@ -178,6 +187,12 @@ int tp_enter_prctl(struct trace_event_raw_sys_enter *ctx) {
         } else {
             ic->sticky = (__u32)payload;
         }
+        /* CAP-01E-v2: registration records the registering uid as owner */
+        if (payload) {
+            __u64 rid = ((__u64)(__u32)dev << 32) | (__u32)ino;
+            __u32 uid = (__u32)bpf_get_current_uid_gid();
+            bpf_map_update_elem(&root_owner, &rid, &uid, BPF_ANY);
+        }
         return 0;
     }
     if (op == PM_TX_BEGIN_MAGIC) {
@@ -197,14 +212,18 @@ int tp_enter_prctl(struct trace_event_raw_sys_enter *ctx) {
         return 0;
     }
     if (op == PM_TX_ATTACH_MAGIC) {
-        /* CAP-01E: present capability nonce → bind TX to CURRENT task.
-         * Single-use (entry deleted) and tgid-bound (cross-task replay
-         * rejected). No nonce match = no binding = no authority.
+        /* CAP-01E-v2: present capability nonce → bind TX to CURRENT task.
+         * Checks: exists ∧ single-use (deleted on success) ∧ tgid-bound
+         * ∧ uid-bound ∧ not expired. No match = no binding = no authority.
          * Unified control-plane ABI: args[0]=opcode, args[1]=payload. */
         __u64 nonce = BPF_CORE_READ(ctx, args[1]);
         __u64 pid_tgid = bpf_get_current_pid_tgid();
+        __u64 uid_gid = bpf_get_current_uid_gid();
         struct tx_cap *cap = bpf_map_lookup_elem(&tx_caps, &nonce);
-        if (!cap || cap->tgid != (pid_tgid >> 32))
+        if (!cap ||
+            cap->tgid != (pid_tgid >> 32) ||
+            cap->owner_uid != (__u32)(uid_gid & 0xffffffff) ||
+            cap->expires_ns <= bpf_ktime_get_ns())
             return 0;
         struct task_struct *t = bpf_get_current_task_btf();
         struct task_ctx *tc = bpf_task_storage_get(&syscall_marker, t, 0,

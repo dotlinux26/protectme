@@ -17,6 +17,7 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/random.h>
+#include <time.h>
 #include <errno.h>
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
@@ -32,9 +33,20 @@ static void sig_handler(int sig) {
 /* ---- CAP-01E capability issuer -------------------------------------- */
 #define CAP_SOCK_DIR  "/run/protectme"
 #define CAP_SOCK_PATH "/run/protectme/tx.sock"
-struct cap_req  { uint32_t magic; uint32_t pid; uint32_t dev; uint32_t ino; };
+#define CAP_MAX_TTL_MS 60000u
+struct cap_req  { uint32_t magic; uint32_t pid; uint32_t dev; uint32_t ino;
+                  uint32_t ttl_ms; };
 struct cap_resp { uint64_t nonce; };
-#define CAP_REQ_MAGIC 0x31424D50u /* "PMB1" little-endian */
+#define CAP_REQ_MAGIC 0x31424D51u /* "PMB3" v3: +ttl field */
+
+static int caps_fd_root(struct bpf_object *obj) {
+    static int fd = -2;
+    if (fd == -2) {
+        struct bpf_map *m = bpf_object__find_map_by_name(obj, "root_owner");
+        fd = m ? bpf_map__fd(m) : -1;
+    }
+    return fd;
+}
 
 static int cap_issuer_start(void) {
     mkdir(CAP_SOCK_DIR, 0755);
@@ -83,15 +95,40 @@ static void cap_issuer_pump(int fd, struct bpf_object *obj) {
             req.magic == CAP_REQ_MAGIC && req.pid && req.dev && req.ino &&
             getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl) == 0 &&
             cr.pid == req.pid) {   /* anti-spoof: binder must own the claim */
-            uint64_t nonce = 0;
-            if (getrandom(&nonce, sizeof(nonce), 0) == sizeof(nonce)) {
-                struct tx_cap_val { uint32_t dev, ino, tgid, state; } v = {
-                    req.dev, req.ino, req.pid, 1 };
-                int ur = bpf_map_update_elem(caps_fd, &nonce, &v,
-                                             BPF_NOEXIST);
-                fprintf(stderr, "[capiss] update ret=%d\n", ur);
-                if (ur == 0)
-                    resp.nonce = nonce;
+            /* CAP-01E-v2 policy: requester uid must match the uid that
+             * registered (owns) the protected root. Root lookup via the
+             * root_owner map maintained by PM_INODE_SET. */
+            __u64 rid = ((__u64)req.dev << 32) | req.ino;
+            __u32 owner = 0;
+            int have_owner = bpf_map_lookup_elem(caps_fd_root(obj), &rid,
+                                                 &owner) == 0;
+            if (have_owner && owner != cr.uid) {
+                fprintf(stderr,
+                    "[capiss] DENIED cross-uid: root owned by %u, peer %u\n",
+                    owner, cr.uid);
+                resp.nonce = 0;
+            } else {
+                uint64_t nonce = 0;
+                if (getrandom(&nonce, sizeof(nonce), 0) == sizeof(nonce)) {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    __u64 now = (__u64)ts.tv_sec * 1000000000ull
+                              + ts.tv_nsec;
+                    __u32 ttl = req.ttl_ms ? req.ttl_ms : 30000;
+                    if (ttl > CAP_MAX_TTL_MS) ttl = CAP_MAX_TTL_MS;
+                    struct tx_cap_val {
+                        uint32_t dev, ino, tgid, owner_uid;
+                        uint64_t expires_ns;
+                    } v = { req.dev, req.ino, req.pid, cr.uid,
+                            now + (__u64)ttl * 1000000ull };
+                    int ur = bpf_map_update_elem(caps_fd, &nonce, &v,
+                                                 BPF_NOEXIST);
+                    fprintf(stderr,
+                        "[capiss] issue ret=%d ttl=%ums owner=%u\n",
+                        ur, ttl, cr.uid);
+                    if (ur == 0)
+                        resp.nonce = nonce;
+                }
             }
         }
         ssize_t sr = send(c, &resp, sizeof(resp), 0);

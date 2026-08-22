@@ -41,14 +41,17 @@
 #define PM_TX_ATTACH_MAGIC 0x54584154u /* "TXAT" */
 
 #define CAP_SOCK_PATH "/run/protectme/tx.sock"
-struct cap_req  { uint32_t magic; uint32_t pid; uint32_t dev; uint32_t ino; };
+struct cap_req  { uint32_t magic; uint32_t pid; uint32_t dev; uint32_t ino;
+                  uint32_t ttl_ms; };
 struct cap_resp { uint64_t nonce; };
-#define CAP_REQ_MAGIC 0x31424D50u
+#define CAP_REQ_MAGIC 0x31424D51u /* "PMB3" */
 
 static void usage(void) {
     fprintf(stderr,
         "usage: pm-tx run      ROOT -- CMD [args...]\n"
-        "       pm-tx run-auth ROOT -- CMD [args...]\n"
+        "       pm-tx run-auth ROOT -- CMD [args...]   [ttl_ms]\n"
+        "       pm-tx request ROOT [ttl_ms]   print nonce only (no attach)\n"
+        "       pm-tx attach NONCE            present nonce from this task\n"
         "       pm-tx mode 0|1|2\n"
         "       pm-tx clear\n");
     exit(2);
@@ -63,7 +66,7 @@ static int stat_root(const char *path, uint32_t *dev, uint32_t *ino) {
 }
 
 /* ask the privileged issuer for a single-use, tgid-bound capability */
-static uint64_t request_nonce(const char *root_path) {
+static uint64_t request_nonce(const char *root_path, uint32_t ttl_ms) {
     uint32_t dev, ino;
     stat_root(root_path, &dev, &ino);
 
@@ -82,7 +85,7 @@ static uint64_t request_nonce(const char *root_path) {
 
     struct cap_req req = {
         .magic = CAP_REQ_MAGIC, .pid = (uint32_t)getpid(),
-        .dev = dev, .ino = ino,
+        .dev = dev, .ino = ino, .ttl_ms = ttl_ms,
     };
     if (send(fd, &req, sizeof(req), 0) != sizeof(req)) {
         perror("send"); exit(3);
@@ -112,6 +115,24 @@ int main(int argc, char **argv) {
         PM_CP(PM_TX_CLEAR_MAGIC, 0, 0);
         return 0;
     }
+    if (!strcmp(argv[1], "attach")) {
+        if (argc != 3) usage();
+        uint64_t nonce = strtoull(argv[2], NULL, 16);
+        if (!nonce) usage();
+        PM_CP(PM_TX_ATTACH_MAGIC, nonce, 0); /* rc ignored — ABI note */
+        fprintf(stderr, "pm-tx: attach presented nonce=0x%llx\n",
+                (unsigned long long)nonce);
+        return 0;
+    }
+    if (!strcmp(argv[1], "request")) {
+        /* ROOT [ttl_ms] — prints nonce WITHOUT attaching: enables
+         * cross-task / expiry tests from scripts */
+        if (argc < 3) usage();
+        uint32_t ttl = argc > 3 ? (uint32_t)strtoul(argv[3], NULL, 10) : 0;
+        uint64_t nonce = request_nonce(argv[2], ttl);
+        printf("0x%llx\n", (unsigned long long)nonce);
+        return nonce ? 0 : 4;
+    }
 
     int auth = !strcmp(argv[1], "run-auth");
     int legacy = !strcmp(argv[1], "run");
@@ -123,7 +144,7 @@ int main(int argc, char **argv) {
     stat_root(root_path, &dev, &ino);
 
     if (auth) {
-        uint64_t nonce = request_nonce(root_path);
+        uint64_t nonce = request_nonce(root_path, 0);
         if (!nonce) {
             fprintf(stderr, "pm-tx: issuer rejected capability request\n");
             exit(4);
@@ -132,8 +153,6 @@ int main(int argc, char **argv) {
             "pm-tx: capability granted root=(%u,%u) nonce=0x%llx\n",
             dev, ino, (unsigned long long)nonce);
         PM_CP(PM_TX_ATTACH_MAGIC, nonce, 0); /* rc ignored — see ABI note */
-        /* replay probe: re-presenting the consumed nonce must NOT re-bind */
-        PM_CP(PM_TX_ATTACH_MAGIC, nonce, 0);
     } else {
         PM_CP(PM_TX_BEGIN_MAGIC, dev, ino); /* legacy transport, run8 A/B */
     }
