@@ -1,7 +1,78 @@
 # Protectme — Semantics Layer (protectme-semantics)
 
-Status: research formulation v0.2 (2026-08-22). This is the "HOW TO UNDERSTAND"
-half of the project. It may evolve on traces/graphs independently of kernel code.
+Status: research formulation v0.3 (2026-08-22). This is the "HOW TO UNDERSTAND"
+half of the project — the **filesystem intent model**. It may evolve on
+traces/graphs independently of kernel code.
+
+## Core principle: intent is a primitive, not a heuristic
+
+```
+intent = explicit, kernel-visible, constrained semantic context
+NOT    = "model thinks this looks like rm -rf"
+```
+
+Protectme must NOT become an EDR/AI behavior detector. Applications (or a
+compatibility wrapper) declare operation context explicitly; the layer validates,
+binds, tracks, enforces:
+
+```
+Application
+    │  explicit operation/context declaration
+    ▼
+Protectme Intent Layer
+    ├── validate scope
+    ├── bind objects
+    ├── track lifecycle
+    └── enforce invariants
+    │
+    ▼
+LSM / VFS
+```
+
+## Intent taxonomy (beyond destruction)
+
+`rm -rf` is the FIRST USE CASE — chosen because it is the hardest problem, so it
+hardens the model against vague abstraction. The same primitive generalizes:
+
+| Intent | Meaning | Example |
+|---|---|---|
+| SAFE | ordinary mutation | editor save, git checkout |
+| DESTRUCTIVE | subtree collapse | `rm -rf`, rmtree |
+| SENSITIVE | policy-routed special object | keys, configs |
+| INTEGRITY | "never modify" | RFC/spec/config files |
+| REPLACEMENT | no atomic-replace | binaries, signing keys, release artifacts |
+| MIGRATION | deliberate move sequence | renames+unlinks as one authorized op |
+| BULK_MUTATION | valid transaction touching many objects | differs semantically from "thousands of odd changes" |
+| RECOVERY | rollback/restore operation | separate policy class for restore flows |
+
+Triage shape:
+
+```
+filesystem operations
+        │
+        ▼
+Protectme Intent
+        │
+  ┌─────┼──────┐
+SAFE  DESTRUCTIVE  SENSITIVE
+ │       │            │
+ALLOW   DENY       POLICY
+```
+
+## Division of labor between the two projects
+
+```
+protectme-semantics : WHAT is this operation semantically trying to do?
+                      (filesystem intent model)
+protectme-kernel    : IS this intent permitted?
+                      (enforcement substrate)
+
+intent → policy → ALLOW / DENY
+```
+
+Long-term: protectme-semantics may decouple from any specific LSM
+implementation and become a **semantic model/API for Linux filesystem tooling**
+in general.
 
 ## Positioning: a semantic safety plane, not a new filesystem
 
