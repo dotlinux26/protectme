@@ -140,6 +140,30 @@ destroy root or collapse subtree                          → DENY
 This is not chmod, not ACL, not immutable bit, not snapshot: it is a
 **semantic safety contract** bound to the object and its tree.
 
+## Product state model & CLI contract (2026-08-22)
+
+Protection is a STATE, not an authority to bypass:
+
+```
+PROTECTED    ├── normal mutation → ALLOW
+             └── destruction     → DENY
+UNPROTECTED  └── filesystem behaves normally
+```
+
+Destroying protected data = changing the state first (`protectme -u PATH`),
+then ordinary tools work. There is no user-facing destruction authority that
+punches through policy; the RUN8 TX primitive remains research-only
+(see architecture.md "THE PIVOT").
+
+Git-style CLI — object-driven, no policy vocabulary:
+
+```bash
+protectme /project          # protect (dir→TREE, file→FILE, auto-resolved)
+protectme -u /project       # unprotect this object only (no recursion)
+protectme -l                # list protected objects
+protectme -s                # status (ACTIVE / DEGRADED / NOT ACTIVE)
+```
+
 ## The classification problem (OPEN)
 
 Input: VFS operation stream. Output: `NORMAL_MUTATION` | `DESTRUCTIVE_TRAVERSAL`.

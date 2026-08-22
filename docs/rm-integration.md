@@ -36,14 +36,15 @@ $ rm -rf ~/project
 rm: cannot remove '/home/user/project': Operation not permitted
 protectme: protected tree
 
-$ protectme destroy ~/project        # intent-management command
-Destroy transaction authorized.
-
-$ rm -rf ~/project                   # success
+$ protectme -u ~/project           # lift protection (state change)
+$ rm -rf ~/project                 # works — object is unprotected now
 ```
 
-`protectme destroy PATH [-- CMD…]` = explicit intent declaration (one-shot TX).
-No aliases (`alias rm=…`) — those are UX hacks invisible to `execve("/usr/bin/rm")`.
+`protectme destroy PATH [-- CMD…]`, if ever shipped, is pure UX sugar over
+(confirm intent → unprotect → exec rm) — NOT a destruction authority and NOT
+in the MVP. Protection is a state; destroying protected data requires
+changing that state first. No command carries a "magic destruction authority"
+that punches through policy (see architecture.md, THE PIVOT).
 
 ## Wrapper mechanics (drop-in replacement)
 
