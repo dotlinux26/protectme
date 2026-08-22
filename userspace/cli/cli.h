@@ -8,11 +8,13 @@ namespace protectme::cli {
 struct Config {
     std::string command;
     std::string path;
-    std::string mode = "DENY";
+    std::string mode;
     bool list = false;
     bool status = false;
-    bool remove = false;
+    bool reload = false;
+    bool unprotect = false;
     bool help = false;
+    std::vector<std::string> destroy_args;
 };
 
 Config parse_args(int argc, char* argv[]);

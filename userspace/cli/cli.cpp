@@ -1,7 +1,8 @@
 #include "cli.h"
 #include "commands.h"
 #include <iostream>
-#include <filesystem>
+#include <string>
+#include <vector>
 
 namespace protectme::cli {
 
@@ -11,27 +12,46 @@ Config parse_args(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         
-        if (arg == "--list" || arg == "-l") {
+        if (arg == "-l" || arg == "--list") {
             config.list = true;
-        } else if (arg == "--status" || arg == "-s") {
+        } else if (arg == "-s" || arg == "--status") {
             config.status = true;
-        } else if (arg == "--remove" || arg == "-r") {
-            config.remove = true;
-        } else if (arg == "--help" || arg == "-h") {
+        } else if (arg == "-r" || arg == "--reload") {
+            config.reload = true;
+        } else if (arg == "-u" || arg == "--unprotect") {
+            config.unprotect = true;
+        } else if (arg == "-h" || arg == "--help") {
             config.help = true;
-        } else if (arg.rfind("--mode=", 0) == 0) {
-            config.mode = arg.substr(7);
-        } else if (arg[0] != '-') {
-            if (config.command.empty()) {
-                config.command = arg;
-            } else if (config.path.empty()) {
+        } else if (arg == "destroy") {
+            config.command = "destroy";
+            // Collect remaining args for destroy
+            for (int j = i + 1; j < argc; ++j) {
+                config.destroy_args.push_back(argv[j]);
+            }
+            break;
+        } else if (arg[0] == '-') {
+            std::cerr << "Unknown option: " << arg << "\n";
+            config.help = true;
+        } else {
+            if (config.path.empty()) {
                 config.path = arg;
             }
         }
     }
     
-    if (config.help || (config.command.empty() && !config.list && !config.status)) {
+    // Determine command
+    if (config.help || (config.path.empty() && !config.list && !config.status && !config.reload && !config.unprotect && config.destroy_args.empty())) {
         config.help = true;
+    } else if (config.unprotect) {
+        config.command = "unprotect";
+    } else if (config.list) {
+        config.command = "list";
+    } else if (config.status) {
+        config.command = "status";
+    } else if (config.reload) {
+        config.command = "reload";
+    } else if (!config.path.empty() && config.command.empty()) {
+        config.command = "protect";
     }
     
     return config;
@@ -50,23 +70,39 @@ int run(const Config& config) {
         return cmd_status();
     }
     
-    if (config.remove) {
+    if (config.reload) {
+        return cmd_reload();
+    }
+    
+    if (config.unprotect) {
         if (config.path.empty()) {
-            std::cerr << "Error: path required for --remove\n";
+            std::cerr << "Error: path required for -u\n";
             return 1;
         }
         return cmd_unprotect(config.path);
     }
     
+    if (!config.destroy_args.empty()) {
+        // Reconstruct argv for destroy
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>("protectme"));
+        argv.push_back(const_cast<char*>("destroy"));
+        for (const auto& arg : config.destroy_args) {
+            argv.push_back(const_cast<char*>(arg.c_str()));
+        }
+        argv.push_back(nullptr);
+        return cmd_destroy(argv.size() - 1, argv.data());
+    }
+    
     if (config.command == "protect") {
         if (config.path.empty()) {
-            std::cerr << "Error: path required for protect\n";
+            std::cerr << "Error: path required\n";
             return 1;
         }
         return cmd_protect(config.path, config.mode);
     }
     
-    std::cerr << "Error: unknown command: " << config.command << "\n";
+    std::cerr << "Error: unknown command\n";
     return 1;
 }
 

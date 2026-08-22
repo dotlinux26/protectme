@@ -1,0 +1,36 @@
+[Unit]
+Description=Protectme filesystem protection daemon
+Documentation=man:protectmed(8)
+After=network.target
+ConditionPathExists=/etc/protectme/policy
+ConditionPathExists=/sys/kernel/security/lsm
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/protectme/protectmed
+WorkingDirectory=/usr/lib/protectme
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# Capabilities required
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_BPF
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_BPF
+
+[Install]
+WantedBy=multi-user.target

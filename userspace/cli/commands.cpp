@@ -4,102 +4,312 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <cstring>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <linux/prctl.h>
+#include <cstdint>
 
 namespace protectme::cli {
 
-constexpr const char* POLICY_FILE = "/etc/protectme/protected";
+constexpr const char* POLICY_FILE = "/etc/protectme/policy";
+constexpr const char* SOCKET_PATH = "/run/protectme/tx.sock";
 
-int cmd_protect(const std::string& path, const std::string& mode) {
+// Prctl magic numbers (must match kernel)
+constexpr uint32_t PM_INODE_SET_MAGIC = 0x494E4F44;  // "INOD"
+constexpr uint32_t PM_INODE_DEL_MAGIC = 0x44454C49;  // "DELI"
+constexpr uint32_t PM_MODE_SET_MAGIC  = 0x4D4F4445;  // "MODE"
+constexpr uint32_t PM_TX_REVOKE_MAGIC = 0x52564B45;  // "RVKE"
+constexpr uint32_t CAP_REQ_MAGIC = 0x34424D50;       // "PMB4"
+constexpr uint32_t CAP_REV_MAGIC = 0x34424D35;       // "PMB5"
+
+struct cap_req {
+    uint32_t magic;
+    uint32_t pid;
+    uint32_t dev;
+    uint32_t ino;
+    uint32_t ttl_ms;
+};
+
+struct cap_resp {
+    uint64_t nonce;
+};
+
+static int syscall_prctl(uint32_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    return syscall(SYS_prctl, op, a1, a2, a3, a4);
+}
+
+static bool stat_root(const std::string& path, uint32_t* dev, uint32_t* ino) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        return false;
+    }
+    *dev = st.st_dev;
+    *ino = st.st_ino;
+    return true;
+}
+
+static int socket_connect() {
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    strncpy(sa.sun_path, "/run/protectme/tx.sock", sizeof(sa.sun_path) - 1);
+    if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+int cmd_protect(const std::string& path, const std::string& /*mode_str*/) {
     std::filesystem::path p(path);
-    auto canonical = std::filesystem::canonical(p);
-    
-    std::ofstream policy(POLICY_FILE, std::ios::app);
+    std::string canonical;
+    try {
+        canonical = std::filesystem::canonical(path).string();
+    } catch (...) {
+        std::cerr << "Error: invalid path: " << path << "\n";
+        return 1;
+    }
+
+    uint32_t dev, ino;
+    if (!stat_root(canonical, &dev, &ino)) {
+        std::cerr << "Error: cannot stat: " << canonical << "\n";
+        return 1;
+    }
+
+    // Check if it's a directory or file
+    struct stat st;
+    stat(canonical.c_str(), &st);
+    const char* type = S_ISDIR(st.st_mode) ? "TREE" : "FILE";
+
+    // Write to policy file (root required)
+    std::ofstream policy("/etc/protectme/policy", std::ios::app);
     if (!policy) {
         std::cerr << "Error: cannot open policy file (need root?)\n";
         return 1;
     }
-    
-    policy << canonical.string() << " " << mode << "\n";
-    std::cout << "Protected: " << canonical.string() << " [" << mode << "]\n";
+    policy << type << " " << canonical << "\n";
+    std::cout << "Protected: " << canonical << " [" << type << "]\n";
+
+    // Also register in kernel immediately via prctl
+    syscall_prctl(PM_INODE_SET_MAGIC, dev, ino, 0xFEEDFACE, 0);
     return 0;
 }
 
 int cmd_unprotect(const std::string& path) {
-    std::filesystem::path p(path);
-    auto canonical = std::filesystem::canonical(p);
-    
-    std::ifstream in(POLICY_FILE);
+    std::string canonical;
+    try {
+        canonical = std::filesystem::canonical(path).string();
+    } catch (...) {
+        std::cerr << "Error: invalid path: " << path << "\n";
+        return 1;
+    }
+
+    uint32_t dev, ino;
+    if (!stat_root(canonical, &dev, &ino)) {
+        std::cerr << "Error: cannot stat: " << canonical << "\n";
+        return 1;
+    }
+
+    // Remove from policy file
+    std::ifstream in("/etc/protectme/policy");
     if (!in) {
         std::cerr << "Error: no policy file found\n";
         return 1;
     }
-    
+
     std::string line;
     std::vector<std::string> lines;
     bool found = false;
-    
+
     while (std::getline(in, line)) {
-        if (line.rfind(canonical.string() + " ", 0) == 0) {
+        // Check if line contains our path (after TREE/FILE)
+        if (line.rfind("TREE " + canonical + " ", 0) == 0 ||
+            line.rfind("TREE " + canonical, 0) == 0 ||
+            line.rfind("FILE " + canonical + " ", 0) == 0 ||
+            line.rfind("FILE " + canonical, 0) == 0) {
             found = true;
             continue;
         }
         lines.push_back(line);
     }
-    
+
     if (!found) {
-        std::cerr << "Path not in protected list: " << canonical.string() << "\n";
+        std::cerr << "Path not in protected list: " << canonical << "\n";
         return 1;
     }
-    
-    std::ofstream out(POLICY_FILE);
+
+    std::ofstream out("/etc/protectme/policy");
     for (const auto& l : lines) {
         out << l << "\n";
     }
-    
-    std::cout << "Unprotected: " << canonical.string() << "\n";
+
+    // Also unregister in kernel
+    syscall_prctl(PM_INODE_DEL_MAGIC, dev, ino, 0, 0);
+
+    std::cout << "Unprotected: " << canonical << "\n";
     return 0;
 }
 
 int cmd_list() {
-    std::ifstream in(POLICY_FILE);
+    std::ifstream in("/etc/protectme/policy");
     if (!in) {
         std::cout << "No protected paths\n";
         return 0;
     }
-    
+
     std::string line;
     std::cout << "Protected paths:\n";
     while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
         std::cout << "  " << line << "\n";
     }
     return 0;
 }
 
 int cmd_status() {
-    std::cout << "protectme status: not implemented (daemon not running)\n";
+    int fd = socket_connect();
+    if (fd < 0) {
+        std::cout << "STATE=DEAD (daemon unreachable)\n";
+        return 1;
+    }
+
+    // Send a simple ping or just check state file
+    close(fd);
+
+    std::ifstream state("/run/protectme/state");
+    if (!state) {
+        std::cout << "STATE=DEAD (no state file)\n";
+        return 1;
+    }
+
+    std::string line, state_val = "UNKNOWN";
+    long tm = 0;
+    while (std::getline(state, line)) {
+        if (line.rfind("STATE=", 0) == 0) state_val = line.substr(6);
+        if (line.rfind("time=", 0) == 0) tm = std::stol(line.substr(5));
+    }
+
+    long now = time(nullptr);
+    bool fresh = (now - tm) < 5;
+    std::cout << "STATE=" << state_val << " (" << (fresh ? "ACTIVE" : "STALE/DEAD") << ", age=" << (now - tm) << "s)\n";
+    return fresh && state_val == "ACTIVE" ? 0 : 1;
+}
+
+int cmd_reload() {
+    // Use systemctl reload for systemd-managed daemon
+    if (system("systemctl reload protectmed") != 0) {
+        std::cerr << "Error: failed to reload policy (systemctl reload protectmed)\n";
+        return 1;
+    }
+    std::cout << "Policy reload triggered\n";
     return 0;
+}
+
+int cmd_destroy(int argc, char* argv[]) {
+    if (argc < 3) {
+        std::cerr << "Usage: protectme destroy <path> -- <cmd> [args...]\n";
+        return 1;
+    }
+
+    std::string path = argv[2];
+    if (argc < 4 || std::string(argv[3]) != "--") {
+        std::cerr << "Usage: protectme destroy <path> -- <cmd> [args...]\n";
+        return 1;
+    }
+
+    std::string canonical;
+    try {
+        canonical = std::filesystem::canonical(argv[2]).string();
+    } catch (...) {
+        std::cerr << "Error: invalid path: " << argv[2] << "\n";
+        return 1;
+    }
+
+    uint32_t dev, ino;
+    if (!stat_root(canonical, &dev, &ino)) {
+        std::cerr << "Error: cannot stat: " << canonical << "\n";
+        return 1;
+    }
+
+    // Request capability
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if (fd < 0) { perror("socket"); return 1; }
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    strncpy(sa.sun_path, "/run/protectme/tx.sock", sizeof(sa.sun_path) - 1);
+    if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        perror("connect");
+        close(fd);
+        return 1;
+    }
+
+    struct cap_req req;
+    req.magic = CAP_REQ_MAGIC;
+    req.pid = static_cast<uint32_t>(getpid());
+    req.dev = dev;
+    req.ino = ino;
+    req.ttl_ms = 30000;
+    if (send(fd, &req, sizeof(req), 0) != sizeof(req)) { perror("send"); close(fd); return 1; }
+
+    // Receive fd via SCM_RIGHTS
+    char buf[CMSG_SPACE(sizeof(int))];
+    struct iovec iov = { (void*)"x", 1 };
+    struct msghdr mh = { nullptr, 0, &iov, 1, buf, sizeof(buf), 0 };
+    ssize_t n = recvmsg(fd, &mh, 0);
+    close(fd);
+    if (n <= 0) { std::cerr << "Error: no response from daemon\n"; return 1; }
+
+    struct cmsghdr* cm = CMSG_FIRSTHDR(&mh);
+    if (!cm || cm->cmsg_type != SCM_RIGHTS) {
+        std::cerr << "Error: no fd received\n";
+        return 1;
+    }
+    int cap_fd = *(int*)CMSG_DATA(cm);
+
+    // Attach capability via prctl
+    syscall_prctl(0x41544644, cap_fd, 0, 0, 0); // ATFD
+
+    // Exec the command
+    char** cmd_argv = &argv[4];
+    execvp(cmd_argv[0], cmd_argv);
+    perror("execvp");
+    return 1;
 }
 
 int cmd_help() {
     std::cout << R"(protectme - kernel-level filesystem safety interlock
 
 Usage:
-  protectme <path>              Protect a path (default mode: DENY)
-  protectme <path> --mode=MODE  Protect with mode (DENY|QUARANTINE)
-  protectme --list              List protected paths
-  protectme --remove <path>     Unprotect a path
-  protectme --status            Show daemon status
-  protectme --help              Show this help
-
-Modes:
-  DENY       - Block destructive operations on protected root
-  QUARANTINE - Allow deletion but quarantine for 24h (not implemented)
+  protectme <path>              Protect a path (tree or file)
+  protectme -u <path>           Unprotect a path
+  protectme -l                  List protected paths
+  protectme -s                  Show daemon status
+  protectme -r                  Reload policy (SIGHUP)
+  protectme destroy <path> -- <cmd> [args...]  Authorized destruction
 
 Examples:
-  protectme ~/project
-  protectme ~/data --mode=DENY
-  protectme --list
-  protectme --remove ~/old-project
+  protectme ~/project              # Protect a directory
+  protectme /etc/secret.key        # Protect a file
+  protectme -u ~/project           # Unprotect
+  protectme -l                     # List protected
+  protectme -s                     # Daemon status
+  protectme -r                     # Reload policy
+  protectme destroy ~/project -- rm -rf ~/project  # Authorized destroy
+
+Notes:
+  - Normal operations (create, write, rename within, hardlink) always ALLOWED
+  - Destructive traversal (rm -rf, find -delete, shutil.rmtree, mv out) DENIED without capability
+  - Use 'protectme destroy' to obtain a one-time capability for authorized destruction
+  - Policy file: /etc/protectme/policy
+  - Daemon: systemctl start protectmed
 )";
     return 0;
 }

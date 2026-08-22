@@ -1,0 +1,21 @@
+#!/bin/bash
+set -e
+
+# Clean up runtime directories on purge
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/protectme
+    rm -rf /var/log/protectme
+    rm -rf /run/protectme
+    rm -f /etc/protectme/policy
+    rm -f /etc/protectme/daemon.conf
+    
+    # Remove protectme group if empty
+    if getent group protectme >/dev/null; then
+        delgroup --system protectme >/dev/null 2>&1 || true
+    fi
+fi
+
+# Reload systemd
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+exit 0

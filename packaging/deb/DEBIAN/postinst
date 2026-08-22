@@ -1,0 +1,41 @@
+#!/bin/bash
+set -e
+
+# Create directories
+mkdir -p /var/lib/protectme
+mkdir -p /var/log/protectme
+mkdir -p /run/protectme
+
+# Create protectme group if not exists
+if ! getent group protectme >/dev/null; then
+    addgroup --system protectme
+fi
+
+# Set permissions
+chown root:protectme /run/protectme
+chmod 770 /run/protectme
+chown root:protectme /var/lib/protectme
+chmod 770 /var/lib/protectme
+chown root:protectme /var/log/protectme
+chmod 770 /var/log/protectme
+
+# Create default policy if not exists
+if [ ! -f /etc/protectme/policy ]; then
+    cat > /etc/protectme/policy <<'EOF'
+# Protectme policy
+# TREE <path> [U <uid>]    # Protect directory subtree
+# FILE <path> [U <uid>]    # Protect single file
+# MODE <0|1|2>             # Global enforcement mode (0=off, 1=root-only, 2=strict)
+MODE 2
+EOF
+fi
+
+# Reload systemd
+systemctl daemon-reload
+
+# Enable and start service
+systemctl enable protectmed >/dev/null 2>&1 || true
+systemctl start protectmed >/dev/null 2>&1 || true
+
+echo "protectme installed. Run 'protectme -s' to check status."
+exit 0

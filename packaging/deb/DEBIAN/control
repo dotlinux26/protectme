@@ -1,0 +1,24 @@
+Package: protectme
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: libc6 (>= 2.31), libbpf1 (>= 0.6), libelf1 (>= 0.176), systemd (>= 245), linux-image-5.2 | linux-image-5.4 | linux-image-5.10 | linux-image-5.15 | linux-image-6.0 | linux-image-6.1 | linux-image-6.2 | linux-image-6.3 | linux-image-6.4 | linux-image-6.5 | linux-image-6.6 | linux-image-6.7 | linux-image-6.8 | linux-image-6.9 | linux-image-6.10 | linux-image-6.11
+Recommends: linux-headers-generic
+Maintainer: Protectme Team <protectme@dotlinux26.github.io>
+Description: Kernel-enforced filesystem safety layer
+ Protectme prevents accidental destructive operations (rm -rf, find -delete,
+ shutil.rmtree, custom traversal) on protected filesystem trees while allowing
+ normal mutation operations. Uses BPF-LSM for kernel enforcement with explicit
+ FD-based capability authorization.
+ .
+ Features:
+  * Tool-independent enforcement (rm, find, python, custom C)
+  * FD-based capability model (possession = authority)
+  * Persistent policy with automatic reconciliation
+  * Epoch-based global revoke (O(1))
+  * Rename-out and cross-filesystem rename protection
+  * OverlayFS lower-layer protection
+  * Ancestor boundary walk (PM_WALK_MAX=16)
+  * Heartbeat DEAD-state visibility
+Homepage: https://github.com/dotlinux26/protectme
