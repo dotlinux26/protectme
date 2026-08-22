@@ -460,20 +460,32 @@ int main(int argc, char **argv) {
             { .fd = cap_fd, .events = POLLIN },
         };
         int pr = poll(pfd, 2, 100);
+        int perr = errno; /* capture BEFORE anything clobbers it */
         if (g_reload) {
             g_reload = 0;
             fprintf(stderr, "policy: SIGHUP — reconciling\n");
             policy_reconcile();
         }
-        if (pr < 0 && errno != EINTR) break;
-        if (pfd[1].revents & POLLIN) cap_issuer_pump(cap_fd, obj);
+        if (pr < 0) {
+            if (perr != EINTR) {
+                fprintf(stderr, "exit: poll failed errno=%d\n", perr);
+                break;
+            }
+        } else if (pfd[1].revents & POLLIN) {
+            cap_issuer_pump(cap_fd, obj);
+        }
         err = ring_buffer__poll(rb, 0);
-        if (err == -EINTR) break;
+        if (err == -EINTR) {
+            fprintf(stderr, "exit: ringbuf EINTR\n");
+            break;
+        }
         if (err < 0 && err != -EAGAIN) {
             fprintf(stderr, "Ring buffer poll error: %d\n", err);
             break;
         }
     }
+    fprintf(stderr, "exit: mainloop done exiting=%d err=%d\n",
+            exiting, err);
 
 cleanup:
     ring_buffer__free(rb);
