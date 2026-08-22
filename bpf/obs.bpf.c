@@ -47,6 +47,7 @@ struct protectme_event {
     __u32 marker;       /* transient ctx_source: set by sys_enter_*, cleared at exit */
     __u32 ctx_sticky;   /* userspace-set persistent context (prctl magic channel) */
     __u32 inode_sticky; /* protected inode state (LRU hash) */
+    __u32 p_sticky;     /* state of PARENT directory inode */
 
     char target_name[64];
 };
@@ -146,7 +147,6 @@ int tp_exit_rmdir(void *ctx)  { marker_set(0); return 0; }
 
 #define PM_DELEGATE_MAGIC 0xDEADBEEF
 #define PM_PROTECTED_MAGIC 0xFEEDFACE
-#define PM_INODE_SET_MAGIC 0x494E4F44 /* "INOD" in hex */
 
 static inline void marker_read_from(struct task_ctx *out, struct task_struct *t) {
     out->active = 0;
@@ -252,11 +252,14 @@ int trace_vfs_unlink(struct pt_regs *ctx) {
         e->marker = tc.active ? tc.active : 0xFFFFFFFF;
         e->ctx_sticky = tc.sticky;
     }
-    /* read inode state from LRU hash */
+    /* read inode state from LRU hash: target + parent dir */
     {
         struct inode_key ik = { .dev = BPF_CORE_READ(target, i_sb, s_dev), .ino = BPF_CORE_READ(target, i_ino) };
         struct task_ctx *ic = bpf_map_lookup_elem(&inode_state, &ik);
         e->inode_sticky = ic ? ic->sticky : 0;
+        struct inode_key pk = { .dev = e->parent_dev, .ino = (__u32)e->parent_ino };
+        struct task_ctx *pc = bpf_map_lookup_elem(&inode_state, &pk);
+        e->p_sticky = pc ? pc->sticky : 0;
     }
     bpf_ringbuf_submit(e, 0);
     return 0;
@@ -298,11 +301,14 @@ int trace_vfs_rmdir(struct pt_regs *ctx) {
         e->marker = tc.active ? tc.active : 0xFFFFFFFF;
         e->ctx_sticky = tc.sticky;
     }
-    /* read inode state from LRU hash */
+    /* read inode state from LRU hash: target + parent dir */
     {
         struct inode_key ik = { .dev = BPF_CORE_READ(target, i_sb, s_dev), .ino = BPF_CORE_READ(target, i_ino) };
         struct task_ctx *ic = bpf_map_lookup_elem(&inode_state, &ik);
         e->inode_sticky = ic ? ic->sticky : 0;
+        struct inode_key pk = { .dev = e->parent_dev, .ino = (__u32)e->parent_ino };
+        struct task_ctx *pc = bpf_map_lookup_elem(&inode_state, &pk);
+        e->p_sticky = pc ? pc->sticky : 0;
     }
     bpf_ringbuf_submit(e, 0);
     return 0;
@@ -327,8 +333,12 @@ int trace_vfs_rename(struct pt_regs *ctx) {
     // PARM1 = renamedata*
     struct renamedata *rd = (struct renamedata *)PT_REGS_PARM1(ctx);
     struct dentry *old_dentry = BPF_CORE_READ(rd, old_dentry);
+    struct dentry *old_parent = BPF_CORE_READ(rd, old_parent);
+    struct inode *old_dir = BPF_CORE_READ(old_parent, d_inode);
 
     struct inode *target = BPF_CORE_READ(old_dentry, d_inode);
+    e->parent_ino = BPF_CORE_READ(old_dir, i_ino);
+    e->parent_dev = BPF_CORE_READ(old_dir, i_sb, s_dev);
     e->target_ino = BPF_CORE_READ(target, i_ino);
     e->target_dev = BPF_CORE_READ(target, i_sb, s_dev);
     e->target_mode = BPF_CORE_READ(target, i_mode) & 0xFFFF;
@@ -342,11 +352,14 @@ int trace_vfs_rename(struct pt_regs *ctx) {
         e->marker = tc.active ? tc.active : 0xFFFFFFFF;
         e->ctx_sticky = tc.sticky;
     }
-    /* read inode state from LRU hash */
+    /* read inode state from LRU hash: target + parent dir */
     {
         struct inode_key ik = { .dev = BPF_CORE_READ(target, i_sb, s_dev), .ino = BPF_CORE_READ(target, i_ino) };
         struct task_ctx *ic = bpf_map_lookup_elem(&inode_state, &ik);
         e->inode_sticky = ic ? ic->sticky : 0;
+        struct inode_key pk = { .dev = e->parent_dev, .ino = (__u32)e->parent_ino };
+        struct task_ctx *pc = bpf_map_lookup_elem(&inode_state, &pk);
+        e->p_sticky = pc ? pc->sticky : 0;
     }
     bpf_ringbuf_submit(e, 0);
     return 0;

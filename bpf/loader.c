@@ -24,7 +24,7 @@ static void print_layout(void) {
     fprintf(stderr,
         "layout: sizeof=%zu seq=%zu pid=%zu comm=%zu op=%zu "
         "parent_ino=%zu target_ino=%zu mode=%zu type=%zu "
-        "pdev=%zu tdev=%zu marker=%zu sticky=%zu inode=%zu name=%zu (expect 196/8/16/36/68/88/96/104/108/112/116/120/124/128/132)\n",
+        "pdev=%zu tdev=%zu marker=%zu sticky=%zu inode=%zu psticky=%zu name=%zu (expect 200/8/16/36/68/88/96/104/108/112/116/120/124/128/132/136)\n",
         sizeof(struct protectme_event),
         offsetof(struct protectme_event, seq),
         offsetof(struct protectme_event, pid),
@@ -39,6 +39,7 @@ static void print_layout(void) {
         offsetof(struct protectme_event, marker),
         offsetof(struct protectme_event, ctx_sticky),
         offsetof(struct protectme_event, inode_sticky),
+        offsetof(struct protectme_event, p_sticky),
         offsetof(struct protectme_event, target_name));
 }
 
@@ -61,11 +62,11 @@ static unsigned long long observed_seq = 0;
 static int print_event(void *ctx, void *data, size_t size) {
     struct protectme_event *e = data;
     char type_char = type_char_of(e->target_type);
-    printf("%-4llu %-6u %-6u %-6u %-15s %-11s 0x%-6llx 0x%-8llx %c %04o %u %u 0x%08x 0x%08x 0x%08x %s\n",
+    printf("%-4llu %-6u %-6u %-6u %-15s %-11s 0x%-6llx 0x%-8llx %c %04o %u %u 0x%08x 0x%08x 0x%08x 0x%08x %s\n",
            ++observed_seq, e->pid, e->tgid, e->uid, e->comm, e->op,
            (unsigned long long)e->parent_ino, (unsigned long long)e->target_ino,
            type_char, e->target_mode, e->parent_dev, e->target_dev,
-           e->marker, e->ctx_sticky, e->inode_sticky, e->target_name);
+           e->marker, e->ctx_sticky, e->inode_sticky, e->p_sticky, e->target_name);
     fflush(stdout);
     return 0;
 }

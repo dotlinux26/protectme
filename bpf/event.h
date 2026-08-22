@@ -30,6 +30,7 @@ struct protectme_event {
     __u32 marker;
     __u32 ctx_sticky;
     __u32 inode_sticky;
+    __u32 p_sticky;
 
     char target_name[64];
 };
