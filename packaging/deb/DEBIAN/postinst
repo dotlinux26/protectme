@@ -13,11 +13,16 @@ fi
 
 # Set permissions
 chown root:protectme /run/protectme
-chmod 770 /run/protectme
+chmod 775 /run/protectme
 chown root:protectme /var/lib/protectme
-chmod 770 /var/lib/protectme
+chmod 775 /var/lib/protectme
 chown root:protectme /var/log/protectme
-chmod 770 /var/log/protectme
+chmod 775 /var/log/protectme
+
+# Ensure state file is readable by protectme group
+touch /run/protectme/state
+chown root:protectme /run/protectme/state
+chmod 664 /run/protectme/state
 
 # Create default policy if not exists
 if [ ! -f /etc/protectme/policy ]; then

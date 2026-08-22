@@ -7,6 +7,7 @@
 #include <cstring>
 #include <unistd.h>
 #include <signal.h>
+#include <cstdlib>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -212,78 +213,6 @@ int cmd_reload() {
     return 0;
 }
 
-int cmd_destroy(int argc, char* argv[]) {
-    if (argc < 3) {
-        std::cerr << "Usage: protectme destroy <path> -- <cmd> [args...]\n";
-        return 1;
-    }
-
-    std::string path = argv[2];
-    if (argc < 4 || std::string(argv[3]) != "--") {
-        std::cerr << "Usage: protectme destroy <path> -- <cmd> [args...]\n";
-        return 1;
-    }
-
-    std::string canonical;
-    try {
-        canonical = std::filesystem::canonical(argv[2]).string();
-    } catch (...) {
-        std::cerr << "Error: invalid path: " << argv[2] << "\n";
-        return 1;
-    }
-
-    uint32_t dev, ino;
-    if (!stat_root(canonical, &dev, &ino)) {
-        std::cerr << "Error: cannot stat: " << canonical << "\n";
-        return 1;
-    }
-
-    // Request capability
-    int fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
-    if (fd < 0) { perror("socket"); return 1; }
-    struct sockaddr_un sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sun_family = AF_UNIX;
-    strncpy(sa.sun_path, "/run/protectme/tx.sock", sizeof(sa.sun_path) - 1);
-    if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
-        perror("connect");
-        close(fd);
-        return 1;
-    }
-
-    struct cap_req req;
-    req.magic = CAP_REQ_MAGIC;
-    req.pid = static_cast<uint32_t>(getpid());
-    req.dev = dev;
-    req.ino = ino;
-    req.ttl_ms = 30000;
-    if (send(fd, &req, sizeof(req), 0) != sizeof(req)) { perror("send"); close(fd); return 1; }
-
-    // Receive fd via SCM_RIGHTS
-    char buf[CMSG_SPACE(sizeof(int))];
-    struct iovec iov = { (void*)"x", 1 };
-    struct msghdr mh = { nullptr, 0, &iov, 1, buf, sizeof(buf), 0 };
-    ssize_t n = recvmsg(fd, &mh, 0);
-    close(fd);
-    if (n <= 0) { std::cerr << "Error: no response from daemon\n"; return 1; }
-
-    struct cmsghdr* cm = CMSG_FIRSTHDR(&mh);
-    if (!cm || cm->cmsg_type != SCM_RIGHTS) {
-        std::cerr << "Error: no fd received\n";
-        return 1;
-    }
-    int cap_fd = *(int*)CMSG_DATA(cm);
-
-    // Attach capability via prctl
-    syscall_prctl(0x41544644, cap_fd, 0, 0, 0); // ATFD
-
-    // Exec the command
-    char** cmd_argv = &argv[4];
-    execvp(cmd_argv[0], cmd_argv);
-    perror("execvp");
-    return 1;
-}
-
 int cmd_help() {
     std::cout << R"(protectme - kernel-level filesystem safety interlock
 
@@ -293,7 +222,6 @@ Usage:
   protectme -l                  List protected paths
   protectme -s                  Show daemon status
   protectme -r                  Reload policy (SIGHUP)
-  protectme destroy <path> -- <cmd> [args...]  Authorized destruction
 
 Examples:
   protectme ~/project              # Protect a directory
@@ -302,14 +230,13 @@ Examples:
   protectme -l                     # List protected
   protectme -s                     # Daemon status
   protectme -r                     # Reload policy
-  protectme destroy ~/project -- rm -rf ~/project  # Authorized destroy
 
 Notes:
   - Normal operations (create, write, rename within, hardlink) always ALLOWED
   - Destructive traversal (rm -rf, find -delete, shutil.rmtree, mv out) DENIED without capability
-  - Use 'protectme destroy' to obtain a one-time capability for authorized destruction
   - Policy file: /etc/protectme/policy
   - Daemon: systemctl start protectmed
+  - v0.1.0: authorized destruction (destroy subcommand) deferred to v0.2
 )";
     return 0;
 }

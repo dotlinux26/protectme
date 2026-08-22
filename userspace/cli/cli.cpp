@@ -22,13 +22,6 @@ Config parse_args(int argc, char* argv[]) {
             config.unprotect = true;
         } else if (arg == "-h" || arg == "--help") {
             config.help = true;
-        } else if (arg == "destroy") {
-            config.command = "destroy";
-            // Collect remaining args for destroy
-            for (int j = i + 1; j < argc; ++j) {
-                config.destroy_args.push_back(argv[j]);
-            }
-            break;
         } else if (arg[0] == '-') {
             std::cerr << "Unknown option: " << arg << "\n";
             config.help = true;
@@ -40,7 +33,7 @@ Config parse_args(int argc, char* argv[]) {
     }
     
     // Determine command
-    if (config.help || (config.path.empty() && !config.list && !config.status && !config.reload && !config.unprotect && config.destroy_args.empty())) {
+    if (config.help || (config.path.empty() && !config.list && !config.status && !config.reload && !config.unprotect)) {
         config.help = true;
     } else if (config.unprotect) {
         config.command = "unprotect";
@@ -80,18 +73,6 @@ int run(const Config& config) {
             return 1;
         }
         return cmd_unprotect(config.path);
-    }
-    
-    if (!config.destroy_args.empty()) {
-        // Reconstruct argv for destroy
-        std::vector<char*> argv;
-        argv.push_back(const_cast<char*>("protectme"));
-        argv.push_back(const_cast<char*>("destroy"));
-        for (const auto& arg : config.destroy_args) {
-            argv.push_back(const_cast<char*>(arg.c_str()));
-        }
-        argv.push_back(nullptr);
-        return cmd_destroy(argv.size() - 1, argv.data());
     }
     
     if (config.command == "protect") {

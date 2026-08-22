@@ -14,7 +14,6 @@ struct Config {
     bool reload = false;
     bool unprotect = false;
     bool help = false;
-    std::vector<std::string> destroy_args;
 };
 
 Config parse_args(int argc, char* argv[]);

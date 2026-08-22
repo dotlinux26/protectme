@@ -97,9 +97,6 @@ protectme -s
 
 # Reload policy
 protectme -r
-
-# Authorized destruction
-protectme destroy /path/to/tree -- rm -rf /path/to/tree
 ```
 
 ## Configuration

@@ -13,7 +13,7 @@ protectme -s
 ## Quick Start
 
 ```bash
-# 1. Protect a directory
+# 1. Protect a directory (requires root)
 sudo protectme /home/user/important-project
 
 # 2. Verify it's protected
@@ -28,10 +28,27 @@ rm -rf /home/user/important-project
 # protectme: DENIED - destructive traversal requires authorization
 # root: /home/user/important-project
 
-# 5. Authorized destruction
-protectme destroy /home/user/important-project -- rm -rf /home/user/important-project
+# 5. Unprotect to allow destruction (requires root)
+sudo protectme -u /home/user/important-project
+
+# Now rm -rf works
+rm -rf /home/user/important-project
 # Success - tree removed
 ```
+
+## Sudo Requirements
+
+| Command | Sudo Required? |
+|---------|----------------|
+| `protectme PATH` | Yes (modifies policy + kernel state) |
+| `protectme -u PATH` | Yes (modifies policy + kernel state) |
+| `protectme -l` | No (read-only) |
+| `protectme -s` | No (reads state file) |
+| `protectme -r` | **Yes** (sends SIGHUP to daemon via systemctl) |
+| `rm -rf` on protected tree | No (enforced by kernel) |
+
+> **Note**: `protectme -r` uses `systemctl reload protectmed` which requires root.
+> If you get "Connection timed out" or "failed to reload", run with `sudo protectme -r`.
 
 ## Configuration
 
@@ -48,7 +65,7 @@ MODE 2
 Then reload:
 
 ```bash
-protectme -r
+sudo protectme -r
 ```
 
 ## Checking Status
@@ -65,20 +82,8 @@ protectme -s
 ## Unprotecting
 
 ```bash
-protectme -u /path/to/tree
+sudo protectme -u /path/to/tree
 ```
-
-## Authorized Destruction Pattern
-
-```bash
-# Interactive
-protectme destroy /path/to/tree -- rm -rf /path/to/tree
-
-# In scripts
-protectme destroy /data/backup -- tar -czf /tmp/backup.tar.gz /data/backup && rm -rf /data/backup
-```
-
-The `destroy` subcommand obtains a capability, attaches it, and executes the command — all in one atomic flow.
 
 ## Daemon Management
 
@@ -92,7 +97,7 @@ sudo systemctl restart protectmed
 journalctl -u protectmed -f
 
 # Policy changes apply on reload
-protectme -r
+sudo protectme -r
 # or
 sudo systemctl reload protectmed
 ```
@@ -113,12 +118,10 @@ sudo systemctl start protectmed
 
 **Policy not reloaded?**
 ```bash
-protectme -r
+sudo protectme -r
 # or
 sudo systemctl reload protectmed
 ```
 
-**Capability denied?**
-- Check if tree is in policy (`protectme -l`)
-- Check if daemon is ACTIVE (`protectme -s`)
-- Check epoch: recent REVOKE may have invalidated old caps
+**Permission denied on reload?**
+Run with sudo: `sudo protectme -r`
