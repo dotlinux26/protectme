@@ -73,6 +73,73 @@ static int cap_issuer_start(void) {
     return fd;
 }
 
+/* ---- STATE-01: persistent policy reconciliation --------------------- */
+#define POLICY_PATH "/etc/protectme/policy"
+#define PM_INODE_SET_MAGIC 0x494E4F44u /* must match obs.bpf.c */
+#define PM_MODE_SET_MAGIC2 0x4D4F4445u
+
+static int g_reload; /* set by SIGHUP */
+
+static void on_hup(int s) { (void)s; g_reload = 1; }
+
+/* Re-assert every policy object in the kernel maps. Called at startup and
+ * on SIGHUP. Policy is the source of truth; kernel maps are runtime state.
+ * Objects that cannot be stat'ed are SKIPPED LOUDLY (never silently). */
+static int policy_reconcile(void) {
+    FILE *f = fopen(POLICY_PATH, "r");
+    if (!f) {
+        fprintf(stderr, "policy: none at %s (protection disabled by "
+                        "configuration, not by accident)\n", POLICY_PATH);
+        return 0;
+    }
+    char line[1024];
+    int loaded = 0, skipped = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char type[32], arg[512], extra[32] = "", extra_arg[64] = "";
+        if (line[0] == '#' || line[0] == '\n') continue;
+        int nf = sscanf(line, "%31s %511s %31s %63s",
+                        type, arg, extra, extra_arg);
+        if (nf < 2) continue;
+        unsigned long owner = 0; /* 0 = system/root-owned */
+        if (nf >= 4 && (!strcmp(extra, "U") || !strcmp(extra, "USER")))
+            owner = strtoul(extra_arg, NULL, 10);
+        if (!strcmp(type, "MODE")) {
+            long m = strtol(arg, NULL, 10);
+            if (m < 0 || m > 2) { skipped++; continue; }
+            syscall(SYS_prctl, PM_MODE_SET_MAGIC2, m, 0, 0, 0);
+            fprintf(stderr, "policy: mode=%ld\n", m);
+            loaded++;
+            continue;
+        }
+        if (strcmp(type, "TREE") && strcmp(type, "FILE")) {
+            skipped++;
+            continue;
+        }
+        struct stat st;
+        if (stat(arg, &st)) {
+            fprintf(stderr, "policy: SKIP %-4s %s (%s)\n",
+                    type, arg, strerror(errno));
+            skipped++;
+            continue;
+        }
+        /* registration rides the same tracepoint pm-mark uses;
+         * owner packed (uid<<32)|payload so policy-owned trees grant
+         * capabilities to the right user, not to the loader */
+        syscall(SYS_prctl, PM_INODE_SET_MAGIC,
+                (unsigned long)st.st_dev, (unsigned long)st.st_ino,
+                (unsigned long)(owner << 32 | 0xFEEDFACEul), 0);
+        fprintf(stderr, "policy: LOAD %-4s %s (%lu,%lu) owner=%lu\n",
+                type, arg, (unsigned long)st.st_dev,
+                (unsigned long)st.st_ino, owner);
+        loaded++;
+    }
+    fclose(f);
+    fprintf(stderr,
+        "policy: reconciled %d object(s), %d skipped — source of truth %s\n",
+        loaded, skipped, POLICY_PATH);
+    return loaded;
+}
+
 static void cap_issuer_pump(int fd, struct bpf_object *obj) {
     static int caps_fd = -2;
     if (caps_fd == -2) {
@@ -289,6 +356,11 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
+    signal(SIGHUP, on_hup);
+
+    /* STATE-01: policy is the source of truth — reconcile at startup so a
+     * daemon restart or reboot never silently disables protection */
+    policy_reconcile();
 
     /* CAP-01E: capability issuer socket (root-only by fs perms).
      * Protocol: client sends {u32 'PMB1', u32 pid, u32 dev, u32 ino};
@@ -307,6 +379,11 @@ int main(int argc, char **argv) {
             { .fd = cap_fd, .events = POLLIN },
         };
         int pr = poll(pfd, 2, 100);
+        if (g_reload) {
+            g_reload = 0;
+            fprintf(stderr, "policy: SIGHUP — reconciling\n");
+            policy_reconcile();
+        }
         if (pr < 0 && errno != EINTR) break;
         if (pfd[1].revents & POLLIN) cap_issuer_pump(cap_fd, obj);
         err = ring_buffer__poll(rb, 0);

@@ -238,11 +238,15 @@ int tp_enter_prctl(struct trace_event_raw_sys_enter *ctx) {
         } else {
             ic->sticky = (__u32)payload;
         }
-        /* CAP-01E-v2: registration records the registering uid as owner */
+        /* CAP-01E-v2: registration records the owning uid.
+         * P0.2: args[3] packs (owner<<32)|payload. High word 0 = legacy
+         * callers (pm-mark) → fall back to registering uid. */
         if (payload) {
             __u64 rid = ((__u64)(__u32)dev << 32) | (__u32)ino;
-            __u32 uid = (__u32)bpf_get_current_uid_gid();
-            bpf_map_update_elem(&root_owner, &rid, &uid, BPF_ANY);
+            __u32 owner = (__u32)(payload >> 32);
+            if (!owner)
+                owner = (__u32)bpf_get_current_uid_gid();
+            bpf_map_update_elem(&root_owner, &rid, &owner, BPF_ANY);
         }
         return 0;
     }

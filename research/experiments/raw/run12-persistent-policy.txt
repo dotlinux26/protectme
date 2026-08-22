@@ -1,0 +1,43 @@
+# RUN12 — PERSISTENT POLICY + RECONCILIATION (STATE-01/02) — 2026-08-22
+# /etc/protectme/policy is the source of truth. Loader reconciles kernel
+# runtime state from it at startup and on SIGHUP. Restart/reboot can no
+# longer silently disable protection.
+
+STATE-01a fresh loader startup reconcile
+         policy: LOAD TREE ×3 owner=1000, MODE 2
+         destructive ops denied with ZERO manual registration       [✅]
+STATE-01b missing path in policy
+         "SKIP TREE /tmp/pm-KHONGTONTAI (No such file or directory)"
+         — loud skip, never silent                                  [✅]
+STATE-01c SIGHUP live reload (no restart)
+         new tree protected immediately; stale entries harmless     [✅]
+STATE-02 kill -9 loader mid-flight while holder owns a live FD cap
+         → restart → policy re-asserted → unlink still EPERM;
+         holder's stale fd resolves to nothing (registry is kernel
+         state owned by the BPF object lifetime)                    [✅]
+
+## DESIGN FLAW FOUND & FIXED: policy ownership
+
+First implementation registered policy objects from loader context →
+root_owner = 0 → user 1000 could NEVER legitimately destroy inside its
+own policy-protected trees ("DENIED cross-uid: root owned by 0").
+Protection must not confiscate the owner's authority.
+
+Fix (3 layers):
+1. INODE_SET args[3] packs (owner<<32)|payload; high word 0 keeps
+   legacy pm-mark semantics (owner = registering uid).
+2. Policy grammar: `TREE <path> [U <uid>]`.
+3. Issuer unchanged — it already stamps the PEER uid into FD caps.
+
+Result: user-owned tree + FD capability chain works end-to-end:
+request → SCM_RIGHTS fd → attach → exec rm → destroyed.
+Root-owned lines (no U) remain root-only-delegable by design.
+
+## VERIFIED INVARIANT (new DoD clause)
+"Daemon death or reboot degrades to DEGRADED-visible state and restores
+protection automatically from policy on next start — no silent gap,
+and pre-restart capabilities do not survive."
+
+Next (P0.3): object identity upgrade — name_to_handle_at so policy
+survives path renames/moves within same filesystem (currently stat at
+reconcile time only).
