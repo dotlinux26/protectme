@@ -1,65 +1,88 @@
+#include <linux/types.h>
+#include "event.h"
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <unistd.h>
 #include <signal.h>
+#include <string.h>
 #include <sys/resource.h>
-
-struct event {
-    __u64 timestamp;
-    __u64 seq;
-    __u32 pid;
-    __u32 tgid;
-    __u32 ppid;
-    __u32 uid;
-    __u32 euid;
-    char comm[16];
-    char pcomm[16];
-    char op[8];
-    unsigned long parent_ino;
-    unsigned long target_ino;
-    unsigned short target_mode;
-    unsigned int target_type;
-    unsigned int parent_fsid;
-    unsigned int target_fsid;
-};
+#include <errno.h>
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
     return vfprintf(stderr, format, args);
 }
 
-static volatile bool exiting = false;
+static volatile sig_atomic_t exiting = 0;
 
 static void sig_handler(int sig) {
-    exiting = true;
+    exiting = 1;
 }
 
-static void print_event(void *ctx, void *data, size_t size) {
-    struct event *e = data;
-    char type_char = '?';
-    switch (e->target_type) {
-        case 1: type_char = 'R'; break; // DT_REG
-        case 2: type_char = 'D'; break; // DT_DIR
-        case 4: type_char = 'L'; break; // DT_LNK
-        case 6: type_char = 'B'; break; // DT_BLK
-        case 10: type_char = 'S'; break; // DT_SOCK
+static void print_layout(void) {
+    fprintf(stderr,
+        "layout: sizeof=%zu seq=%zu pid=%zu comm=%zu op=%zu "
+        "parent_ino=%zu target_ino=%zu mode=%zu type=%zu "
+        "pdev=%zu tdev=%zu marker=%zu sticky=%zu inode=%zu name=%zu (expect 196/8/16/36/68/88/96/104/108/112/116/120/124/128/132)\n",
+        sizeof(struct protectme_event),
+        offsetof(struct protectme_event, seq),
+        offsetof(struct protectme_event, pid),
+        offsetof(struct protectme_event, comm),
+        offsetof(struct protectme_event, op),
+        offsetof(struct protectme_event, parent_ino),
+        offsetof(struct protectme_event, target_ino),
+        offsetof(struct protectme_event, target_mode),
+        offsetof(struct protectme_event, target_type),
+        offsetof(struct protectme_event, parent_dev),
+        offsetof(struct protectme_event, target_dev),
+        offsetof(struct protectme_event, marker),
+        offsetof(struct protectme_event, ctx_sticky),
+        offsetof(struct protectme_event, inode_sticky),
+        offsetof(struct protectme_event, target_name));
+}
+
+static char type_char_of(unsigned int stype) {
+    /* value = (st_mode & S_IFMT) >> 12 */
+    switch (stype) {
+        case 1:  return 'P'; /* FIFO   */
+        case 2:  return 'C'; /* CHR    */
+        case 4:  return 'D'; /* DIR    */
+        case 6:  return 'B'; /* BLK    */
+        case 8:  return 'R'; /* REG    */
+        case 10: return 'L'; /* LNK    */
+        case 12: return 'S'; /* SOCK   */
+        default: return '?';
     }
-    printf("%-4llu %-6u %-6u %-6u %-6s %-4s 0x%lx 0x%lx %c %o %u %u\n",
-           e->seq, e->pid, e->tgid, e->uid, e->comm, e->op,
-           e->parent_ino, e->target_ino, type_char,
-           e->target_mode, e->parent_fsid, e->target_fsid);
+}
+
+static unsigned long long observed_seq = 0;
+
+static int print_event(void *ctx, void *data, size_t size) {
+    struct protectme_event *e = data;
+    char type_char = type_char_of(e->target_type);
+    printf("%-4llu %-6u %-6u %-6u %-15s %-11s 0x%-6llx 0x%-8llx %c %04o %u %u 0x%08x 0x%08x 0x%08x %s\n",
+           ++observed_seq, e->pid, e->tgid, e->uid, e->comm, e->op,
+           (unsigned long long)e->parent_ino, (unsigned long long)e->target_ino,
+           type_char, e->target_mode, e->parent_dev, e->target_dev,
+           e->marker, e->ctx_sticky, e->inode_sticky, e->target_name);
+    fflush(stdout);
+    return 0;
 }
 
 int main(int argc, char **argv) {
     struct bpf_object *obj = NULL;
-    struct bpf_program *prog_unlink = NULL, *prog_rmdir = NULL;
+    struct bpf_program *prog;
+    struct bpf_link *link;
     struct ring_buffer *rb = NULL;
-    int err;
+    int err = 0;
 
     libbpf_set_print(libbpf_print_fn);
 
     struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
     setrlimit(RLIMIT_MEMLOCK, &rlim);
+
+    print_layout();
 
     obj = bpf_object__open_file("obs.bpf.o", NULL);
     if (libbpf_get_error(obj)) {
@@ -73,23 +96,15 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    prog_unlink = bpf_object__find_program_by_name(obj, "observe_unlink");
-    prog_rmdir = bpf_object__find_program_by_name(obj, "observe_rmdir");
-    if (!prog_unlink || !prog_rmdir) {
-        fprintf(stderr, "Failed to find programs\n");
-        err = -1;
-        goto cleanup;
-    }
-
-    err = bpf_program__attach(prog_unlink);
-    if (err) {
-        fprintf(stderr, "Failed to attach unlink: %d\n", err);
-        goto cleanup;
-    }
-    err = bpf_program__attach(prog_rmdir);
-    if (err) {
-        fprintf(stderr, "Failed to attach rmdir: %d\n", err);
-        goto cleanup;
+    /* attach EVERY program in the object: kprobes + syscall tracepoints */
+    bpf_object__for_each_program(prog, obj) {
+        link = bpf_program__attach(prog);
+        if (libbpf_get_error(link)) {
+            fprintf(stderr, "Failed to attach program %s\n",
+                    bpf_program__name(prog));
+            err = -1;
+            goto cleanup;
+        }
     }
 
     int map_fd = bpf_object__find_map_fd_by_name(obj, "events");
@@ -109,13 +124,13 @@ int main(int argc, char **argv) {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    printf("SEQ  PID     TGID    UID    COMM   OP     PARENT_INO  TARGET_INO  T TYPE MODE  PFSID TFSID\n");
-    printf("---------------------------------------------------------------------------------------------\n");
+    printf("SEQ  PID     TGID    UID    COMM            OP           PARENT     TARGET     T MODE  PDEV  TDEV  MARKER     CTX        INODE      NAME\n");
+    fflush(stdout);
 
     while (!exiting) {
         err = ring_buffer__poll(rb, 100);
         if (err == -EINTR) break;
-        if (err < 0) {
+        if (err < 0 && err != -EAGAIN) {
             fprintf(stderr, "Ring buffer poll error: %d\n", err);
             break;
         }
