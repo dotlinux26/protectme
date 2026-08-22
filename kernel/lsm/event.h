@@ -32,6 +32,14 @@ struct protectme_event {
     __u32 inode_sticky;
     __u32 p_sticky;
 
+    /* P0-B: LSM decision fields (lsm_* rows only) */
+    __s32 verdict;
+    __u32 class;      /* 0=OUTSIDE 1=SUBTREE_OP 2=ROOT_OP */
+    __u32 near_root;
+    __u32 near_depth;
+    __u32 tx_present;
+    __u64 walk_ns;
+
     char target_name[64];
 };
 

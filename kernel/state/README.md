@@ -17,6 +17,11 @@ struct task_ctx { u32 active; u32 sticky; }
 Planned: destruction-transaction fields `{tx_dev, tx_ino}` binding a task to
 BEGIN(root)/COMMIT(root) (P0-B).
 
+**Update 2026-08-22 (run 8): tx_dev/tx_ino IMPLEMENTED** — bound via prctl
+transport (`pm-tx run ROOT -- CMD`), exec preserves, fork/thread do not inherit,
+exit auto-revokes. Still TRANSPORT-only; production authority = CAP-01E
+(kernel-issued FD capability).
+
 ## Object state (BPF_MAP_TYPE_LRU_HASH, `inode_state`)
 
 ```

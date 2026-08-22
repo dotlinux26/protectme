@@ -24,7 +24,8 @@ static void print_layout(void) {
     fprintf(stderr,
         "layout: sizeof=%zu seq=%zu pid=%zu comm=%zu op=%zu "
         "parent_ino=%zu target_ino=%zu mode=%zu type=%zu "
-        "pdev=%zu tdev=%zu marker=%zu sticky=%zu inode=%zu psticky=%zu name=%zu (expect 200/8/16/36/68/88/96/104/108/112/116/120/124/128/132/136)\n",
+        "pdev=%zu tdev=%zu marker=%zu sticky=%zu inode=%zu psticky=%zu "
+        "verdict=%zu class=%zu nearroot=%zu depth=%zu tx=%zu walkns=%zu name=%zu\n",
         sizeof(struct protectme_event),
         offsetof(struct protectme_event, seq),
         offsetof(struct protectme_event, pid),
@@ -40,6 +41,12 @@ static void print_layout(void) {
         offsetof(struct protectme_event, ctx_sticky),
         offsetof(struct protectme_event, inode_sticky),
         offsetof(struct protectme_event, p_sticky),
+        offsetof(struct protectme_event, verdict),
+        offsetof(struct protectme_event, class),
+        offsetof(struct protectme_event, near_root),
+        offsetof(struct protectme_event, near_depth),
+        offsetof(struct protectme_event, tx_present),
+        offsetof(struct protectme_event, walk_ns),
         offsetof(struct protectme_event, target_name));
 }
 
@@ -62,11 +69,14 @@ static unsigned long long observed_seq = 0;
 static int print_event(void *ctx, void *data, size_t size) {
     struct protectme_event *e = data;
     char type_char = type_char_of(e->target_type);
-    printf("%-4llu %-6u %-6u %-6u %-15s %-11s 0x%-6llx 0x%-8llx %c %04o %u %u 0x%08x 0x%08x 0x%08x 0x%08x %s\n",
+    printf("%-4llu %-6u %-6u %-6u %-15s %-11s 0x%-6llx 0x%-8llx %c %04o %u %u "
+           "0x%08x 0x%08x 0x%08x 0x%08x %d %u 0x%-6x %2u %u %llu %s\n",
            ++observed_seq, e->pid, e->tgid, e->uid, e->comm, e->op,
            (unsigned long long)e->parent_ino, (unsigned long long)e->target_ino,
            type_char, e->target_mode, e->parent_dev, e->target_dev,
-           e->marker, e->ctx_sticky, e->inode_sticky, e->p_sticky, e->target_name);
+           e->marker, e->ctx_sticky, e->inode_sticky, e->p_sticky,
+           e->verdict, e->class, e->near_root, e->near_depth,
+           e->tx_present, (unsigned long long)e->walk_ns, e->target_name);
     fflush(stdout);
     return 0;
 }
@@ -97,9 +107,12 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    /* attach EVERY program in the object: kprobes + syscall tracepoints */
+    /* attach EVERY program: kprobes + syscall tracepoints + LSM hooks */
     bpf_object__for_each_program(prog, obj) {
-        link = bpf_program__attach(prog);
+        if (bpf_program__type(prog) == BPF_PROG_TYPE_LSM)
+            link = bpf_program__attach_lsm(prog);
+        else
+            link = bpf_program__attach(prog);
         if (libbpf_get_error(link)) {
             fprintf(stderr, "Failed to attach program %s\n",
                     bpf_program__name(prog));
@@ -125,7 +138,7 @@ int main(int argc, char **argv) {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    printf("SEQ  PID     TGID    UID    COMM            OP           PARENT     TARGET     T MODE  PDEV  TDEV  MARKER     CTX        INODE      NAME\n");
+    printf("SEQ  PID     TGID    UID    COMM            OP           PARENT     TARGET     T MODE  PDEV  TDEV  MARKER     CTX        INODE      PSTICKY   V CLS ROOT   D TX WALK_NS   NAME\n");
     fflush(stdout);
 
     while (!exiting) {
