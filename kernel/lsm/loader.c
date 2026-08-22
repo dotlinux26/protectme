@@ -17,6 +17,8 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/random.h>
+
+#include <sys/syscall.h>
 #include <time.h>
 #include <errno.h>
 
@@ -36,8 +38,9 @@ static void sig_handler(int sig) {
 #define CAP_MAX_TTL_MS 60000u
 struct cap_req  { uint32_t magic; uint32_t pid; uint32_t dev; uint32_t ino;
                   uint32_t ttl_ms; };
-struct cap_resp { uint64_t nonce; };
-#define CAP_REQ_MAGIC 0x31424D51u /* "PMB3" v3: +ttl field */
+struct cap_resp { uint64_t nonce; }; /* nonce=0 in FD mode; fd rides cmsg */
+#define CAP_REQ_MAGIC 0x34424D50u /* "PMB4" — v4: FD capability protocol */
+#define PM_TX_REGFD_MAGIC 0x52454746u /* "REGF" — must match obs.bpf.c */
 
 static int caps_fd_root(struct bpf_object *obj) {
     static int fd = -2;
@@ -91,6 +94,7 @@ static void cap_issuer_pump(int fd, struct bpf_object *obj) {
         struct cap_req req;
         ssize_t n = recv(c, &req, sizeof(req), 0);
         struct cap_resp resp = { .nonce = 0 };
+        int fd_mode_done = 0;
         if (n == (ssize_t)sizeof(req) &&
             req.magic == CAP_REQ_MAGIC && req.pid && req.dev && req.ino &&
             getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl) == 0 &&
@@ -108,30 +112,60 @@ static void cap_issuer_pump(int fd, struct bpf_object *obj) {
                     owner, cr.uid);
                 resp.nonce = 0;
             } else {
-                uint64_t nonce = 0;
-                if (getrandom(&nonce, sizeof(nonce), 0) == sizeof(nonce)) {
-                    struct timespec ts;
-                    clock_gettime(CLOCK_MONOTONIC, &ts);
-                    __u64 now = (__u64)ts.tv_sec * 1000000000ull
-                              + ts.tv_nsec;
-                    __u32 ttl = req.ttl_ms ? req.ttl_ms : 30000;
-                    if (ttl > CAP_MAX_TTL_MS) ttl = CAP_MAX_TTL_MS;
-                    struct tx_cap_val {
-                        uint32_t dev, ino, tgid, owner_uid;
-                        uint64_t expires_ns;
-                    } v = { req.dev, req.ino, req.pid, cr.uid,
-                            now + (__u64)ttl * 1000000ull };
-                    int ur = bpf_map_update_elem(caps_fd, &nonce, &v,
-                                                 BPF_NOEXIST);
-                    fprintf(stderr,
-                        "[capiss] issue ret=%d ttl=%ums owner=%u\n",
-                        ur, ttl, cr.uid);
-                    if (ur == 0)
-                        resp.nonce = nonce;
+                /* CAP-02 FD path: create the capability object as a memfd,
+                 * register it kernel-side from THIS root process (REGF),
+                 * then hand the fd to the peer over SCM_RIGHTS.
+                 * Possession of the fd becomes the authority. */
+                int m = (int)syscall(SYS_memfd_create, "protectme-tx", 0ul);
+                if (m >= 0) {
+                    unsigned char secret[32];
+                    if (getrandom(secret, sizeof(secret), 0)
+                            != sizeof(secret)) {
+                        close(m);
+                    } else {
+                        if (write(m, secret, sizeof(secret))
+                                != sizeof(secret)) {
+                            /* keep going: content is decorative */
+                        }
+                        uint32_t ttl = req.ttl_ms ? req.ttl_ms : 30000;
+                        if (ttl > CAP_MAX_TTL_MS) ttl = CAP_MAX_TTL_MS;
+                        syscall(SYS_prctl, PM_TX_REGFD_MAGIC,
+                                (unsigned long)m,
+                                (unsigned long)((__u64)cr.uid << 32 | req.dev),
+                                (unsigned long)req.ino,
+                                (unsigned long)ttl);
+                        struct cap_resp ok = { .nonce = 0x1 };
+                        union {
+                            char buf[CMSG_SPACE(sizeof(int))];
+                            struct cmsghdr align;
+                        } u = { .align = {0} };
+                        struct iovec iov = {
+                            .iov_base = &ok, .iov_len = sizeof(ok) };
+                        struct msghdr mh = { .msg_iov = &iov,
+                                             .msg_iovlen = 1 };
+                        mh.msg_control = u.buf;
+                        mh.msg_controllen = sizeof(u.buf);
+                        struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+                        cm->cmsg_level = SOL_SOCKET;
+                        cm->cmsg_type = SCM_RIGHTS;
+                        cm->cmsg_len = CMSG_LEN(sizeof(int));
+                        memcpy(CMSG_DATA(cm), &m, sizeof(int));
+                        ssize_t sr = sendmsg(c, &mh, 0);
+                        fprintf(stderr,
+                            "[capiss] FD issued dev=%u ino=%u ttl=%us "
+                            "sent=%zd errno=%s\n",
+                            req.dev, req.ino, ttl / 1000, sr,
+                            sr < 0 ? strerror(errno) : "-");
+                        close(m);
+                        fd_mode_done = 1;
+                    }
                 }
             }
         }
-        ssize_t sr = send(c, &resp, sizeof(resp), 0);
+        ssize_t sr = -1;
+        /* nonce-mode fallback reply; FD mode already answered via SCM_RIGHTS */
+        if (!fd_mode_done)
+            sr = send(c, &resp, sizeof(resp), 0);
         fprintf(stderr, "[capiss] reply sent=%zd errno=%s\n",
                 sr, sr < 0 ? strerror(errno) : "-");
         close(c);

@@ -43,8 +43,9 @@
 #define CAP_SOCK_PATH "/run/protectme/tx.sock"
 struct cap_req  { uint32_t magic; uint32_t pid; uint32_t dev; uint32_t ino;
                   uint32_t ttl_ms; };
-struct cap_resp { uint64_t nonce; };
-#define CAP_REQ_MAGIC 0x31424D51u /* "PMB3" */
+struct cap_resp { uint64_t nonce; }; /* nonce==1 => fd rides in cmsg */
+#define CAP_REQ_MAGIC 0x34424D50u /* "PMB4" */
+#define PM_TX_ATTFD_MAGIC 0x41544644u /* "ATFD" — must match obs.bpf.c */
 
 static void usage(void) {
     fprintf(stderr,
@@ -65,14 +66,14 @@ static int stat_root(const char *path, uint32_t *dev, uint32_t *ino) {
     return 0;
 }
 
-/* ask the privileged issuer for a single-use, tgid-bound capability */
-static uint64_t request_nonce(const char *root_path, uint32_t ttl_ms) {
+/* ask the privileged issuer for a capability. v4: authority is an FD
+ * (memfd) received over SCM_RIGHTS — kernel-issued object, possession
+ * = authority, close(fd)/exit revokes. */
+static int request_cap_fd(const char *root_path, uint32_t ttl_ms,
+                          uint64_t *nonce_out) {
     uint32_t dev, ino;
     stat_root(root_path, &dev, &ino);
 
-    /* SEQPACKET + connect: reply rides the same connection — no peer
-     * addressing. SO_PEERCRED on the server side binds the claim to the
-     * connecting process, so pid must be our own. */
     int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (fd < 0) { perror("socket"); exit(3); }
     struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
@@ -90,15 +91,31 @@ static uint64_t request_nonce(const char *root_path, uint32_t ttl_ms) {
     if (send(fd, &req, sizeof(req), 0) != sizeof(req)) {
         perror("send"); exit(3);
     }
+
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } u = { .align = {0} };
     struct cap_resp resp;
-    ssize_t n = recv(fd, &resp, sizeof(resp), 0);
+    struct iovec iov = { .iov_base = &resp, .iov_len = sizeof(resp) };
+    struct msghdr mh = { .msg_iov = &iov, .msg_iovlen = 1 };
+    mh.msg_control = u.buf;
+    mh.msg_controllen = sizeof(u.buf);
+    ssize_t n = recvmsg(fd, &mh, 0);
     if (n != (ssize_t)sizeof(resp)) {
         fprintf(stderr, "pm-tx: bad issuer reply (%zd): %s\n",
                 n, strerror(errno));
         exit(3);
     }
     close(fd);
-    return resp.nonce;
+    int cfd = -1;
+    for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm;
+         cm = CMSG_NXTHDR(&mh, cm)) {
+        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS)
+            memcpy(&cfd, CMSG_DATA(cm), sizeof(int));
+    }
+    if (nonce_out) *nonce_out = resp.nonce;
+    return cfd; /* -1 when issuer refused */
 }
 
 int main(int argc, char **argv) {
@@ -124,14 +141,43 @@ int main(int argc, char **argv) {
                 (unsigned long long)nonce);
         return 0;
     }
+    if (!strcmp(argv[1], "expiry-probe")) {
+        /* ROOT TTL_MS DELAY_S — single process: request, wait, attach,
+         * then unlink ROOT/probe.txt and report. Isolates expiry from
+         * cross-task confounders. */
+        if (argc != 5) usage();
+        uint32_t ttl = (uint32_t)strtoul(argv[3], NULL, 10);
+        int delay = atoi(argv[4]);
+        uint64_t nr = 0;
+        int cfd = request_cap_fd(argv[2], ttl, &nr);
+        if (cfd < 0) { printf("RESULT=request-refused\n"); return 4; }
+        fprintf(stderr, "probe: fd=%d ttl=%ums delay=%ds\n",
+                cfd, ttl, delay);
+        sleep(delay);
+        PM_CP(PM_TX_ATTFD_MAGIC, cfd, 0);
+        char pbuf[512];
+        snprintf(pbuf, sizeof(pbuf), "%s/probe.txt", argv[2]);
+        int r = unlink(pbuf);
+        printf("RESULT=%s\n", r == 0 ? "BIND-OK" : "BIND-DENIED");
+        return r == 0 ? 0 : 5;
+    }
+    if (!strcmp(argv[1], "attachfd")) {
+        /* present fd NUMBER N of THIS process as capability */
+        if (argc != 3) usage();
+        long n = strtol(argv[2], NULL, 10);
+        PM_CP(PM_TX_ATTFD_MAGIC, n, 0); /* rc ignored — ABI note */
+        fprintf(stderr, "pm-tx: presented fd=%ld\n", n);
+        return 0;
+    }
     if (!strcmp(argv[1], "request")) {
-        /* ROOT [ttl_ms] — prints nonce WITHOUT attaching: enables
-         * cross-task / expiry tests from scripts */
+        /* ROOT [ttl_ms] — obtain capability FD, print its number WITHOUT
+         * attaching. Process exit closes it (= revoke). */
         if (argc < 3) usage();
         uint32_t ttl = argc > 3 ? (uint32_t)strtoul(argv[3], NULL, 10) : 0;
-        uint64_t nonce = request_nonce(argv[2], ttl);
-        printf("0x%llx\n", (unsigned long long)nonce);
-        return nonce ? 0 : 4;
+        uint64_t nr = 0;
+        int cfd = request_cap_fd(argv[2], ttl, &nr);
+        printf("fd=%d granted=%d\n", cfd, cfd >= 0);
+        return cfd >= 0 ? 0 : 4;
     }
 
     int auth = !strcmp(argv[1], "run-auth");
@@ -144,15 +190,16 @@ int main(int argc, char **argv) {
     stat_root(root_path, &dev, &ino);
 
     if (auth) {
-        uint64_t nonce = request_nonce(root_path, 0);
-        if (!nonce) {
-            fprintf(stderr, "pm-tx: issuer rejected capability request\n");
+        uint64_t nr = 0;
+        int cfd = request_cap_fd(root_path, 0, &nr);
+        if (cfd < 0) {
+            fprintf(stderr, "pm-tx: issuer refused capability\n");
             exit(4);
         }
         fprintf(stderr,
-            "pm-tx: capability granted root=(%u,%u) nonce=0x%llx\n",
-            dev, ino, (unsigned long long)nonce);
-        PM_CP(PM_TX_ATTACH_MAGIC, nonce, 0); /* rc ignored — see ABI note */
+            "pm-tx: capability fd=%d root=(%u,%u)\n", cfd, dev, ino);
+        PM_CP(PM_TX_ATTFD_MAGIC, cfd, 0); /* rc ignored — ABI note */
+        /* fd intentionally NOT CLOEXEC: exec preserves authority */
     } else {
         PM_CP(PM_TX_BEGIN_MAGIC, dev, ino); /* legacy transport, run8 A/B */
     }

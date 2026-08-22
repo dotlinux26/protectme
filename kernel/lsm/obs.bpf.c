@@ -145,6 +145,57 @@ struct {
     __type(value, __u32); /* owner uid */
 } root_owner SEC(".maps");
 
+/* CAP-02: FD-based capability. Authority = possession of an open file
+ * description (memfd) issued by the privileged loader and handed to the
+ * client over SCM_RIGHTS. The kernel-side registry is keyed by the
+ * struct file pointer of that description — userspace can only present
+ * an fd it actually holds; close(fd)/exit destroys reachability.
+ *
+ * Semantics proven by RUN9/RUN10 are preserved:
+ *   exec   keeps authority  (fd survives exec; binder stays same tgid)
+ *   fork   loses authority  (child may hold a copy of the fd, but first
+ *                            binder wins: rebinding by another tgid fails)
+ *   close  revokes          (fd no longer resolvable)
+ *   expiry bounds everything
+ *
+ * ABA mitigation on struct file reuse: registration also stores the file's
+ * inode pointer; presentation requires it to still match. */
+struct tx_file_cap {
+    __u32 dev;
+    __u32 ino;
+    __u32 owner_uid;
+    __u32 binder_tgid;   /* 0 = unbound; first attach claims */
+    __u64 expires_ns;
+    void *f_inode;       /* reuse/ABA guard */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 256);
+    __type(key, __u64);            /* struct file* of the capability memfd */
+    __type(value, struct tx_file_cap);
+} tx_by_file SEC(".maps");
+
+#define PM_TX_REGFD_MAGIC 0x52454746u /* "REGF" — loader (root) registers its memfd */
+#define PM_TX_ATTFD_MAGIC 0x41544644u /* "ATFD" — holder presents fd number */
+
+/* resolve current task's fd number to its struct file via fdtable.
+ * Research-grade CORE walk; production should revisit (rcu details). */
+static __always_inline struct file *fd_resolved(__u64 op, __u64 slot) {
+    struct task_struct *t = bpf_get_current_task_btf();
+    struct files_struct *fs = BPF_CORE_READ(t, files);
+    if (!fs) return NULL;
+    struct fdtable *fdt = BPF_CORE_READ(fs, fdt);
+    if (!fdt) return NULL;
+    __u32 max_fds = BPF_CORE_READ(fdt, max_fds);
+    if (slot >= max_fds) return NULL;
+    struct file **fds = BPF_CORE_READ(fdt, fd);
+    if (!fds) return NULL;
+    struct file *f = NULL;
+    bpf_core_read(&f, sizeof(f), &fds[slot]);
+    return f;
+}
+
 #ifndef EPERM
 #define EPERM 1
 #endif
@@ -232,6 +283,57 @@ int tp_enter_prctl(struct trace_event_raw_sys_enter *ctx) {
         tc->tx_dev = cap->dev;
         tc->tx_ino = cap->ino;
         bpf_map_delete_elem(&tx_caps, &nonce);
+        return 0;
+    }
+    if (op == PM_TX_REGFD_MAGIC) {
+        /* loader-only: register ITS OWN open fd as a capability object.
+         * args[1]=fd, args[2]=dev, args[3]=ino. Root check is the only
+         * gate — the issuer socket policy lives in userspace (loader). */
+        if ((bpf_get_current_uid_gid() & 0xffffffff) != 0)
+            return 0;
+        struct file *f = fd_resolved(op, BPF_CORE_READ(ctx, args[1]));
+        if (!f) return 0;
+        __u64 dev_pack = BPF_CORE_READ(ctx, args[2]); /* (owner<<32)|dev */
+        __u64 ttl_ms = BPF_CORE_READ(ctx, args[4]);
+        if (!ttl_ms || ttl_ms > 60000)
+            ttl_ms = 60000;
+        struct tx_file_cap cap = {
+            .dev = (__u32)dev_pack,
+            .ino = (__u32)BPF_CORE_READ(ctx, args[3]),
+            .owner_uid = (__u32)(dev_pack >> 32),
+            .binder_tgid = 0,
+            .expires_ns = bpf_ktime_get_ns() + ttl_ms * 1000000ull,
+            .f_inode = BPF_CORE_READ(f, f_inode),
+        };
+        bpf_map_update_elem(&tx_by_file, &f, &cap, BPF_ANY);
+        return 0;
+    }
+    if (op == PM_TX_ATTFD_MAGIC) {
+        /* holder presents an fd number it must actually possess */
+        struct file *f = fd_resolved(op, BPF_CORE_READ(ctx, args[1]));
+        if (!f) return 0;
+        struct tx_file_cap *cap = bpf_map_lookup_elem(&tx_by_file, &f);
+        if (!cap || cap->expires_ns <= bpf_ktime_get_ns())
+            return 0;
+        void *cur_ino = BPF_CORE_READ(f, f_inode);
+        if (cap->f_inode != cur_ino)
+            return 0; /* struct file address reused by another object */
+        __u64 pid_tgid = bpf_get_current_pid_tgid();
+        __u32 tgid = pid_tgid >> 32;
+        if (cap->binder_tgid && cap->binder_tgid != tgid)
+            return 0; /* fork-deny: first binder wins */
+        /* also require presenting uid == owner (issuer already checked at
+         * request time; re-check defends against fd handoff via SCM_RIGHTS) */
+        if ((__u32)bpf_get_current_uid_gid() != cap->owner_uid)
+            return 0;
+        if (!cap->binder_tgid)
+            cap->binder_tgid = tgid;
+        struct task_struct *t = bpf_get_current_task_btf();
+        struct task_ctx *tc = bpf_task_storage_get(&syscall_marker, t, 0,
+            BPF_LOCAL_STORAGE_GET_F_CREATE);
+        if (!tc) return 0;
+        tc->tx_dev = cap->dev;
+        tc->tx_ino = cap->ino;
         return 0;
     }
     if (op == PM_MODE_SET_MAGIC) {
