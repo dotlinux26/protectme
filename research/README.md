@@ -1,7 +1,18 @@
 # Protectme Research Evidence
 
 Empirical evidence for the P0 problem statement. Collected on the host of
-the project author; reproducible with the tooling in `../bpf/`.
+the project author; reproducible with the tooling in `../../kernel/lsm/`.
+
+## Layout
+
+```
+research/
+├── traversal/     destruction traversal convergence (run1, run2)
+├── lifecycle/     task context & propagation (run3..5, CAP-01A..C)
+├── semantics/     semantic engine research (OPEN — thesis layer)
+└── experiments/
+    └── raw/       raw logs, filtered extracts, experiment tool sources
+```
 
 ## Environment
 
@@ -16,7 +27,7 @@ the project author; reproducible with the tooling in `../bpf/`.
 
 ## Run 1 — rm single-file vs rm -rf (P0-OBS-01..03)
 
-Raw: `raw/run1-rm-ab-full.log` · events only: `raw/run1-rm-ab-full-events.txt` · filtered: `raw/run1-rm-only.txt`
+Raw: `experiments/raw/run1-rm-ab-full.log` · events only: `experiments/raw/run1-rm-ab-full-events.txt` · filtered: `experiments/raw/run1-rm-only.txt`
 
 Recorded identities (via `stat` before destruction):
 
@@ -47,8 +58,8 @@ Findings:
 
 ## Run 2 — traversal matrix (P0-OBS-04..05)
 
-Raw: `raw/run2-traversal-full.log` · filtered: `raw/run2-traversal-tools-only.txt`
-Tool source: `raw/pm-nftw.c`.
+Raw: `experiments/raw/run2-traversal-full.log` · filtered: `experiments/raw/run2-traversal-tools-only.txt`
+Tool source: `experiments/raw/pm-nftw.c`.
 
 Identities:
 

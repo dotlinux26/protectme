@@ -24,3 +24,7 @@ Thumbs.db
 
 # Executables
 protectme
+kernel/lsm/loader
+
+# Generated BTF header (2.8MB, kernel-version-specific; regenerate via bpftool)
+kernel/lsm/vmlinux.h

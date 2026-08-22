@@ -14,21 +14,18 @@ endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 add_executable(protectme
-    main.cpp
-    cli/cli.cpp
-    cli/commands.cpp
-    daemon/daemon.cpp
-    daemon/enforcer.cpp
-    policy/policy.cpp
-    audit/audit.cpp
+    userspace/main.cpp
+    userspace/cli/cli.cpp
+    userspace/cli/commands.cpp
+    userspace/daemon/daemon.cpp
+    userspace/daemon/enforcer.cpp
+    userspace/policy/policy.cpp
+    userspace/audit/audit.cpp
 )
 
 target_include_directories(protectme PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/cli
-    ${CMAKE_CURRENT_SOURCE_DIR}/daemon
-    ${CMAKE_CURRENT_SOURCE_DIR}/policy
-    ${CMAKE_CURRENT_SOURCE_DIR}/audit
+    ${CMAKE_CURRENT_SOURCE_DIR}/userspace
 )
 
 install(TARGETS protectme DESTINATION bin)

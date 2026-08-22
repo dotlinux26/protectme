@@ -1,12 +1,12 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -Wpedantic -Werror -I.
-LDFLAGS = 
+CXXFLAGS = -std=c++17 -Wall -Wextra -Wpedantic -Werror -I. -Iuserspace
+LDFLAGS =
 
-SRC = main.cpp \
-      cli/cli.cpp cli/commands.cpp \
-      daemon/daemon.cpp daemon/enforcer.cpp \
-      policy/policy.cpp \
-      audit/audit.cpp
+SRC = userspace/main.cpp \
+      userspace/cli/cli.cpp userspace/cli/commands.cpp \
+      userspace/daemon/daemon.cpp userspace/daemon/enforcer.cpp \
+      userspace/policy/policy.cpp \
+      userspace/audit/audit.cpp
 
 OBJ = $(SRC:.cpp=.o)
 TARGET = protectme

@@ -13,9 +13,9 @@ RUN dnf install -y \
     && dnf clean all
 
 WORKDIR /src
-COPY bpf/ .
+COPY kernel/lsm/ .
 
 # Use kernel-devel headers
-RUN KDIR=/usr/src/kernels/$(uname -r) make
+RUN KDIR=$(find /usr/src/kernels -maxdepth 1 -type d -name '*' | head -1) make
 
 CMD ["./loader"]
