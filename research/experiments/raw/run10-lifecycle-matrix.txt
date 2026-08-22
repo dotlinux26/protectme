@@ -14,9 +14,13 @@ $ unlink /tmp/pm-L1/file          -> Operation not permitted          [DENY ✅]
 attach presented nonce=0x6109a30afc3ed759
 unlink                            -> Operation not permitted          [DENY ✅]
 
-== R10-03 accidental extra cross-task proof: $( ) subshell captured nonce,
-   attach ran in sibling pid -> Operation not permitted                  [DENY ✅]
-   (test-design flaw that became evidence; positive control = R10-04)
+== R10-03 *** INVALID TEST *** ($() command substitution spawned a subshell,
+   so request ran as PID A and attach as PID B — the test did not measure
+   what it intended)
+   Kernel behavior observed: unlink -> Operation not permitted.
+   Reclassified as ADDITIONAL cross-task evidence (nonce possession alone
+   is insufficient; capability binds to execution identity), superseded by
+   the deliberate R10-01 fresh-nonce test. Positive control = R10-04.
 
 == R10-04 EXEC KEEPS TX (positive control for request+attach+destroy same chain)
 $ pm-tx run-auth /tmp/pm-L1 -- rm -f /tmp/pm-L1/file -> rc=0           [ALLOW ✅]

@@ -1,7 +1,59 @@
 # Protectme — System Architecture
 
-Status: v1.0 (2026-08-22). Consolidates the two-project split, daemon/CLI
-boundaries, persistent-vs-transient state, and product UX decisions.
+Status: v1.1 (2026-08-22). FEATURE FREEZE in effect: hardening only until
+0.1.0 Definition of Done (below). New ideas → FUTURE.md.
+
+## The boundary, nailed
+
+> Policy lives in userspace. Authority is represented by a kernel-backed
+> capability. Enforcement lives in LSM. The filesystem remains owned by
+> the filesystem.
+
+## Three layers
+
+```text
+                Protectme
+                    │
+     ┌──────────────┼──────────────┐
+     │              │              │
+ Semantics      Authority     Enforcement
+     │              │              │
+ destructive    capability      BPF-LSM
+ traversal      lifecycle         VFS
+ intent         binding          veto
+```
+
+## 0.1.0 Definition of Done
+
+```text
+protectme /project            → protected
+git pull / vim / db / rm child→ normal operation
+rm -rf /project               → DENIED
+find -delete / shutil.rmtree  → DENIED (LSM, not wrapper)
+custom C traversal            → DENIED (LSM, not wrapper)
+protectme -u /project         → protection lifted, fs normal
+reboot                        → policy restored, protection active
+daemon death                  → NO silent-unprotected state (DEGRADED shown)
+non-wrapper userspace         → still enforced by LSM
+```
+
+Failure semantics must distinguish: ACTIVE · DEGRADED · UNSUPPORTED ·
+NOT PROTECTED. "Looks protected but isn't" is a release blocker.
+
+## Execution order (frozen)
+
+```text
+ 1. FD capability                      (CAP-02)
+ 2. persistent policy + state restore  (STATE-01/02)
+ 3. object identity / ancestor correctness
+ 4. capability revoke/lifetime spec
+ 5. BPF-LSM attach/reload stability
+ 6. systemd service
+ 7. CLI: protectme PATH | -u | -l | -s
+ 8. rm integration (shim = UX only)
+ 9. test matrix
+10. .deb package
+```
 
 ## One system, two layers, one user-facing surface
 
