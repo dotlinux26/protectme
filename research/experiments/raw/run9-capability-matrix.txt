@@ -1,0 +1,55 @@
+# RUN9 CAPABILITY MATRIX — Sat Aug 22 11:29:28 AM +07 2026 — single loader 1441830
+
+== setup ==
+mode2 ok
+
+== BASELINE: no cap on protected root ==
+unlink: cannot unlink '/tmp/pm-C9/victim.txt': Operation not permitted
+
+== T1 FORGERY random nonce ==
+unlink victim -> Operation not permitted
+
+== T5 CROSS-TASK stale-valid nonce from dead pid ==
+nonce=0x925780db826d66d0
+unlink victim -> Operation not permitted
+
+== T6 CONTROL forged nonce unprotected dir ==
+ALLOWED (control ok)
+
+== T2 LEGIT issued capability full destroy ==
+connect(cap issuer): No such file or directory
+C9 gone: 
+
+== T3 WRONG-ROOT TX(A) attacks B ==
+connect(cap issuer): No such file or directory
+B intact: YES
+
+== T3b SAME-ROOT TX(A) destroys A ==
+connect(cap issuer): No such file or directory
+A gone: 
+
+== FINAL STATE ==
+/tmp/pm-A:
+x
+
+/tmp/pm-B:
+y
+
+/tmp/pm-C9:
+a
+b
+victim.txt
+
+/tmp/pm-CTL:
+
+== T2 LEGIT issued capability full destroy (binary fixed) ==
+pm-tx: capability granted root=(43,46198) nonce=0xe142064eaebba33f
+rm rc=0
+C9 gone: YES
+== T3 WRONG-ROOT TX(A) attacks B ==
+rmdir: failed to remove '/tmp/pm-B': Operation not permitted
+B intact: YES
+== T3b SAME-ROOT TX(A) destroys A ==
+pm-tx: capability granted root=(43,46199) nonce=0xa48bc80e04dd0fcc
+rm rc=0
+A gone: YES

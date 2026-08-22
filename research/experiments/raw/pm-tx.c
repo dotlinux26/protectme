@@ -1,77 +1,144 @@
-/* pm-tx — destruction-transaction experiment driver (P0-B).
+/* pm-tx.c — Protectme destruction-transaction driver, v2 (CAP-01E)
  *
- * EXPERIMENT TOOL. The prctl channel here is context TRANSPORT only —
- * NOT authorization. See docs/security-model.md.
+ * Subcommands:
+ *   run ROOT -- CMD        legacy prctl transport (run8; kept for A/B tests)
+ *   run-auth ROOT -- CMD   CAP-01E: request kernel-issued nonce from the
+ *                          loader's issuer socket, attach it (single-use,
+ *                          tgid-bound), then exec CMD
+ *   mode N                 set policy mode 0/1/2
+ *   clear                  drop any bound TX on this task
  *
- * Usage:
- *   pm-tx run <root-path> -- CMD [args...]   bind TX(root) to this task,
- *                                            then exec CMD (exec preserves
- *                                            task ctx; exit auto-revokes)
- *   pm-tx mode <0|1|2>                       0=OBSERVE 1=ROOT_ONLY 2=TX_STRICT
- *   pm-tx clear                              drop tx binding from this task
+ * Research prototype — not a production tool.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <stdint.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 
-#define PM_TX_BEGIN_MAGIC  0x54584247UL /* "TXBG" */
-#define PM_TX_CLEAR_MAGIC  0x5458434CUL /* "TXCL" */
-#define PM_MODE_SET_MAGIC  0x4D4F4445UL /* "MODE" */
+/* CONTROL-PLANE ABI (research quirk, unchanged since run8):
+ * the opcode travels IN THE OPTION SLOT: syscall(SYS_prctl, PM_MAGIC, p1, p2).
+ * The kernel-side hook is a sys_enter_prctl TRACEPOINT — side effects always
+ * execute, but core prctl then rejects the unknown option with EINVAL.
+ * Therefore return values are IGNORED by design; do not "fix" this by
+ * switching to prctl(66, ...) without changing the BPF parser too. */
+#define PM_CP(OP, A1, A2) syscall(SYS_prctl, (OP), (A1), (A2), 0, 0)
 
-static int bind_tx(const char *path, unsigned long *dev_out, unsigned long *ino_out) {
+#ifndef PR_SET_PM_CTX
+#define PR_SET_PM_CTX 66 /* unused; kept to document rejected alternative */
+#endif
+
+#define PM_TX_BEGIN_MAGIC  0x54584247u /* "TXBG" */
+#define PM_TX_CLEAR_MAGIC  0x5458434Cu /* "TXCL" */
+#define PM_MODE_SET_MAGIC  0x4D4F4445u /* "MODE" */
+#define PM_TX_ATTACH_MAGIC 0x54584154u /* "TXAT" */
+
+#define CAP_SOCK_PATH "/run/protectme/tx.sock"
+struct cap_req  { uint32_t magic; uint32_t pid; uint32_t dev; uint32_t ino; };
+struct cap_resp { uint64_t nonce; };
+#define CAP_REQ_MAGIC 0x31424D50u
+
+static void usage(void) {
+    fprintf(stderr,
+        "usage: pm-tx run      ROOT -- CMD [args...]\n"
+        "       pm-tx run-auth ROOT -- CMD [args...]\n"
+        "       pm-tx mode 0|1|2\n"
+        "       pm-tx clear\n");
+    exit(2);
+}
+
+static int stat_root(const char *path, uint32_t *dev, uint32_t *ino) {
     struct stat st;
-    if (stat(path, &st)) { perror("stat"); return -1; }
-    unsigned long dev = (unsigned long)st.st_dev; /* NOTE: userspace st_dev
-        encoding can differ from kernel s_dev on some filesystems; verified
-        consistent on tmpfs/ext4 dev numbers used in experiments */
-    unsigned long ino = (unsigned long)st.st_ino;
-    long r = syscall(SYS_prctl, PM_TX_BEGIN_MAGIC, dev, ino, 0, 0);
-    fprintf(stderr, "[pm-tx] bound TX root=%s dev=%lu ino=%lu (prctl saw args rc=%ld)\n",
-            path, dev, ino, r);
-    if (dev_out) *dev_out = dev;
-    if (ino_out) *ino_out = ino;
+    if (stat(path, &st)) { perror("stat"); exit(3); }
+    *dev = (uint32_t)st.st_dev;
+    *ino = (uint32_t)st.st_ino;
     return 0;
 }
 
+/* ask the privileged issuer for a single-use, tgid-bound capability */
+static uint64_t request_nonce(const char *root_path) {
+    uint32_t dev, ino;
+    stat_root(root_path, &dev, &ino);
+
+    /* SEQPACKET + connect: reply rides the same connection — no peer
+     * addressing. SO_PEERCRED on the server side binds the claim to the
+     * connecting process, so pid must be our own. */
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (fd < 0) { perror("socket"); exit(3); }
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_un srv = { .sun_family = AF_UNIX };
+    strncpy(srv.sun_path, CAP_SOCK_PATH, sizeof(srv.sun_path) - 1);
+    if (connect(fd, (struct sockaddr *)&srv, sizeof(srv))) {
+        perror("connect(cap issuer)"); exit(3);
+    }
+
+    struct cap_req req = {
+        .magic = CAP_REQ_MAGIC, .pid = (uint32_t)getpid(),
+        .dev = dev, .ino = ino,
+    };
+    if (send(fd, &req, sizeof(req), 0) != sizeof(req)) {
+        perror("send"); exit(3);
+    }
+    struct cap_resp resp;
+    ssize_t n = recv(fd, &resp, sizeof(resp), 0);
+    if (n != (ssize_t)sizeof(resp)) {
+        fprintf(stderr, "pm-tx: bad issuer reply (%zd): %s\n",
+                n, strerror(errno));
+        exit(3);
+    }
+    close(fd);
+    return resp.nonce;
+}
+
 int main(int argc, char **argv) {
-    if (argc >= 3 && !strcmp(argv[1], "mode")) {
-        unsigned long m = strtoul(argv[2], NULL, 0);
-        syscall(SYS_prctl, PM_MODE_SET_MAGIC, m, 0, 0, 0);
-        printf("[pm-tx] policy mode -> %lu (%s)\n", m,
-               m == 0 ? "OBSERVE" : m == 1 ? "ROOT_ONLY" :
-               m == 2 ? "TRANSACTION_STRICT" : "?");
+    if (argc < 2) usage();
+
+    if (!strcmp(argv[1], "mode")) {
+        if (argc != 3) usage();
+        long m = strtol(argv[2], NULL, 10);
+        if (m < 0 || m > 2) usage();
+        PM_CP(PM_MODE_SET_MAGIC, m, 0);
         return 0;
     }
-    if (argc == 2 && !strcmp(argv[1], "clear")) {
-        syscall(SYS_prctl, PM_TX_CLEAR_MAGIC, 0, 0, 0, 0);
-        printf("[pm-tx] tx cleared\n");
+    if (!strcmp(argv[1], "clear")) {
+        PM_CP(PM_TX_CLEAR_MAGIC, 0, 0);
         return 0;
     }
-    if (argc >= 4 && !strcmp(argv[1], "run") && !strcmp(argv[3], "--")) {
-        char **cmd = &argv[4];
-        pid_t p = fork();
-        if (p < 0) { perror("fork"); return 1; }
-        if (p == 0) {
-            if (bind_tx(argv[2], NULL, NULL)) _exit(126);
-            execvp(cmd[0], cmd);          /* task ctx survives exec (CAP-01B) */
-            perror("execvp");
-            _exit(127);
+
+    int auth = !strcmp(argv[1], "run-auth");
+    int legacy = !strcmp(argv[1], "run");
+    if ((!auth && !legacy) || argc < 4 || strcmp(argv[3], "--")) usage();
+    const char *root_path = argv[2];
+    char **cmd = &argv[4];
+
+    uint32_t dev, ino;
+    stat_root(root_path, &dev, &ino);
+
+    if (auth) {
+        uint64_t nonce = request_nonce(root_path);
+        if (!nonce) {
+            fprintf(stderr, "pm-tx: issuer rejected capability request\n");
+            exit(4);
         }
-        int st = 0;
-        waitpid(p, &st, 0);
-        if (WIFEXITED(st))  printf("[pm-tx] child exited %d\n", WEXITSTATUS(st));
-        else                printf("[pm-tx] child killed by %d\n", WTERMSIG(st));
-        return 0;
+        fprintf(stderr,
+            "pm-tx: capability granted root=(%u,%u) nonce=0x%llx\n",
+            dev, ino, (unsigned long long)nonce);
+        PM_CP(PM_TX_ATTACH_MAGIC, nonce, 0); /* rc ignored — see ABI note */
+        /* replay probe: re-presenting the consumed nonce must NOT re-bind */
+        PM_CP(PM_TX_ATTACH_MAGIC, nonce, 0);
+    } else {
+        PM_CP(PM_TX_BEGIN_MAGIC, dev, ino); /* legacy transport, run8 A/B */
     }
-    fprintf(stderr,
-        "usage: %s run <root-path> -- CMD [args...]\n"
-        "       %s mode <0|1|2>\n"
-        "       %s clear\n", argv[0], argv[0], argv[0]);
-    return 1;
+
+    execvp(cmd[0], cmd);
+    fprintf(stderr, "pm-tx: exec %s failed: %s\n", cmd[0], strerror(errno));
+    return 5;
 }

@@ -111,9 +111,30 @@ struct {
 
 #define PM_CTX_MAGIC       0xC0DEC0DE
 #define PM_INODE_SET_MAGIC 0x494E4F44
-#define PM_TX_BEGIN_MAGIC  0x54584247 /* "TXBG" */
+#define PM_TX_BEGIN_MAGIC  0x54584247 /* "TXBG" — DEPRECATED transport, run8 */
 #define PM_TX_CLEAR_MAGIC  0x5458434C /* "TXCL" */
 #define PM_MODE_SET_MAGIC  0x4D4F4445 /* "MODE" */
+#define PM_TX_ATTACH_MAGIC 0x54584154 /* "TXAT" — CAP-01E capability attach */
+
+/* CAP-01E: kernel-issued capability store. Only the privileged issuer
+ * (loader, root) writes entries; clients present a 64-bit nonce via
+ * prctl(TXAT). Nonce is SINGLE-USE and TGID-BOUND, so knowing the channel
+ * without a valid unguessable nonce grants nothing. This still is not full
+ * production authority (issuer policy lives in userspace), but it removes
+ * "know magic = authority". */
+struct tx_cap {
+    __u32 dev;
+    __u32 ino;
+    __u32 tgid;   /* intended holder — cross-task replay rejected */
+    __u32 state;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 256);
+    __type(key, __u64);            /* nonce */
+    __type(value, struct tx_cap);
+} tx_caps SEC(".maps");
 
 #ifndef EPERM
 #define EPERM 1
@@ -173,6 +194,25 @@ int tp_enter_prctl(struct trace_event_raw_sys_enter *ctx) {
         struct task_struct *t = bpf_get_current_task_btf();
         struct task_ctx *tc = bpf_task_storage_get(&syscall_marker, t, 0, 0);
         if (tc) { tc->tx_dev = 0; tc->tx_ino = 0; }
+        return 0;
+    }
+    if (op == PM_TX_ATTACH_MAGIC) {
+        /* CAP-01E: present capability nonce → bind TX to CURRENT task.
+         * Single-use (entry deleted) and tgid-bound (cross-task replay
+         * rejected). No nonce match = no binding = no authority.
+         * Unified control-plane ABI: args[0]=opcode, args[1]=payload. */
+        __u64 nonce = BPF_CORE_READ(ctx, args[1]);
+        __u64 pid_tgid = bpf_get_current_pid_tgid();
+        struct tx_cap *cap = bpf_map_lookup_elem(&tx_caps, &nonce);
+        if (!cap || cap->tgid != (pid_tgid >> 32))
+            return 0;
+        struct task_struct *t = bpf_get_current_task_btf();
+        struct task_ctx *tc = bpf_task_storage_get(&syscall_marker, t, 0,
+            BPF_LOCAL_STORAGE_GET_F_CREATE);
+        if (!tc) return 0;
+        tc->tx_dev = cap->dev;
+        tc->tx_ino = cap->ino;
+        bpf_map_delete_elem(&tx_caps, &nonce);
         return 0;
     }
     if (op == PM_MODE_SET_MAGIC) {

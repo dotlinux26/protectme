@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <linux/types.h>
 #include "event.h"
 #include <bpf/libbpf.h>
@@ -7,7 +8,15 @@
 #include <unistd.h>
 #include <signal.h>
 #include <string.h>
+#include <errno.h>
+#include <poll.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
+#include <sys/random.h>
 #include <errno.h>
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
@@ -18,6 +27,78 @@ static volatile sig_atomic_t exiting = 0;
 
 static void sig_handler(int sig) {
     exiting = 1;
+}
+
+/* ---- CAP-01E capability issuer -------------------------------------- */
+#define CAP_SOCK_DIR  "/run/protectme"
+#define CAP_SOCK_PATH "/run/protectme/tx.sock"
+struct cap_req  { uint32_t magic; uint32_t pid; uint32_t dev; uint32_t ino; };
+struct cap_resp { uint64_t nonce; };
+#define CAP_REQ_MAGIC 0x31424D50u /* "PMB1" little-endian */
+
+static int cap_issuer_start(void) {
+    mkdir(CAP_SOCK_DIR, 0755);
+    unlink(CAP_SOCK_PATH); /* stale socket from a previous run */
+    /* SEQPACKET: message boundaries + connected reply path (no abstract
+     * peer addressing, which broke across the dgram autobind path) */
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un sa = { .sun_family = AF_UNIX };
+    strncpy(sa.sun_path, CAP_SOCK_PATH, sizeof(sa.sun_path) - 1);
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0 ||
+        listen(fd, 16) < 0) {
+        close(fd);
+        return -1;
+    }
+    /* research build: OPEN issuer — capability is single-use + tgid-bound so
+     * cross-user theft gains nothing beyond issuing your own; per-user policy
+     * store arrives with the daemon phase */
+    chmod(CAP_SOCK_PATH, 0666);
+    fprintf(stderr, "cap issuer listening at %s\n", CAP_SOCK_PATH);
+    return fd;
+}
+
+static void cap_issuer_pump(int fd, struct bpf_object *obj) {
+    static int caps_fd = -2;
+    if (caps_fd == -2) {
+        struct bpf_map *m = bpf_object__find_map_by_name(obj, "tx_caps");
+        caps_fd = m ? bpf_map__fd(m) : -1;
+        fprintf(stderr, "[capiss] pump init caps_fd=%d\n", caps_fd);
+    }
+    if (caps_fd < 0) return;
+    for (;;) {
+        int c = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (c < 0) {
+            if (errno == EAGAIN || errno == EINTR) return;
+            fprintf(stderr, "[capiss] accept: %s\n", strerror(errno));
+            return;
+        }
+        struct ucred cr; socklen_t cl = sizeof(cr);
+        if (!getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl))
+            fprintf(stderr, "[capiss] peer pid=%u uid=%u\n", cr.pid, cr.uid);
+        struct cap_req req;
+        ssize_t n = recv(c, &req, sizeof(req), 0);
+        struct cap_resp resp = { .nonce = 0 };
+        if (n == (ssize_t)sizeof(req) &&
+            req.magic == CAP_REQ_MAGIC && req.pid && req.dev && req.ino &&
+            getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl) == 0 &&
+            cr.pid == req.pid) {   /* anti-spoof: binder must own the claim */
+            uint64_t nonce = 0;
+            if (getrandom(&nonce, sizeof(nonce), 0) == sizeof(nonce)) {
+                struct tx_cap_val { uint32_t dev, ino, tgid, state; } v = {
+                    req.dev, req.ino, req.pid, 1 };
+                int ur = bpf_map_update_elem(caps_fd, &nonce, &v,
+                                             BPF_NOEXIST);
+                fprintf(stderr, "[capiss] update ret=%d\n", ur);
+                if (ur == 0)
+                    resp.nonce = nonce;
+            }
+        }
+        ssize_t sr = send(c, &resp, sizeof(resp), 0);
+        fprintf(stderr, "[capiss] reply sent=%zd errno=%s\n",
+                sr, sr < 0 ? strerror(errno) : "-");
+        close(c);
+    }
 }
 
 static void print_layout(void) {
@@ -138,11 +219,26 @@ int main(int argc, char **argv) {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
+    /* CAP-01E: capability issuer socket (root-only by fs perms).
+     * Protocol: client sends {u32 'PMB1', u32 pid, u32 dev, u32 ino};
+     * loader replies {u64 nonce} (0 = rejected). Nonce is single-use,
+     * tgid-bound; client presents it via prctl(TXAT). */
+    int cap_fd = cap_issuer_start();
+    if (cap_fd < 0)
+        fprintf(stderr, "cap issuer unavailable: %s\n", strerror(errno));
+
     printf("SEQ  PID     TGID    UID    COMM            OP           PARENT     TARGET     T MODE  PDEV  TDEV  MARKER     CTX        INODE      PSTICKY   V CLS ROOT   D TX WALK_NS   NAME\n");
     fflush(stdout);
 
     while (!exiting) {
-        err = ring_buffer__poll(rb, 100);
+        struct pollfd pfd[2] = {
+            { .fd = map_fd, .events = POLLIN },
+            { .fd = cap_fd, .events = POLLIN },
+        };
+        int pr = poll(pfd, 2, 100);
+        if (pr < 0 && errno != EINTR) break;
+        if (pfd[1].revents & POLLIN) cap_issuer_pump(cap_fd, obj);
+        err = ring_buffer__poll(rb, 0);
         if (err == -EINTR) break;
         if (err < 0 && err != -EAGAIN) {
             fprintf(stderr, "Ring buffer poll error: %d\n", err);
