@@ -1,0 +1,37 @@
+# RUN13 — OBJECT IDENTITY + STATE JOURNAL (STATE-03) — 2026-08-22
+# Policy names PATHS; enforcement is per-INODE. /var/lib/protectme/
+# identities.journal remembers the last-resolved (dev,ino) per path so
+# reconcile classifies identity transitions explicitly.
+
+R13-01 RUNTIME RENAME: mv protected tree while daemon alive
+        child unlink under NEW path -> EPERM
+        (enforcement follows inode, not path)                       [✅]
+R13-02 DRIFT: tree renamed away while dead + NEW dir created at the
+        old policy path, then start:
+          identity: WARNING /tmp/pm-P1 now resolves to a DIFFERENT
+                    object: was (43,47039) now (43,47113)
+          policy: DRIFTED  TREE /tmp/pm-P1 (43,47113)
+          policy: SKIP     TREE /tmp/pm-P2 (renamed away, loud)
+          policy: REASSERT TREE /tmp/pm-P3 (same inode)             [✅]
+R13-03 MISSING path while dead -> "SKIP ... (No such file or directory)"
+        (loud, never silent)                                        [✅]
+R13-04 recreate-same-path-new-inode == DRIFTED (covered by R13-02 P1) [✅]
+R13-05 clean restart idempotency: all stable lines -> REASSERT,
+        journal reloaded (3 entries), zero spurious warnings        [✅]
+
+## CLASSIFICATION TABLE
+FRESH    first time this path is seen            register + journal
+REASSERT same object as last load                register (idempotent)
+DRIFTED  path now resolves to different inode    LOUD WARNING +
+                                                 register policy-as-written
+SKIP     path unstat-able                        loud skip, no registration
+
+## SEMANTIC DECISION RECORDED
+On DRIFT the policy-as-written wins (path is what the admin wrote), but
+the transition is never silent. A future protectmed surfaces this as a
+DEGRADED-visible state per DoD. Rename survival at runtime is free —
+kernel maps are keyed by inode; only reconcile-time reasoning needed
+the journal.
+
+Next (P0.4): ancestor/runtime boundary — deep-tree traversal cost and
+correctness for nested registered roots.

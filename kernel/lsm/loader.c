@@ -9,6 +9,9 @@
 #include <signal.h>
 #include <string.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -82,6 +85,66 @@ static int g_reload; /* set by SIGHUP */
 
 static void on_hup(int s) { (void)s; g_reload = 1; }
 
+/* ---- STATE-03 (P0.3): identity journal ------------------------------ */
+/* Policy lines name PATHS; enforcement is per-INODE. The journal remembers
+ * which inode each path resolved to at last successful load, so reconcile
+ * can distinguish "same object, path stable" from "path drifted to a
+ * different object". Append-only text, path stored last. Research build:
+ * paths with spaces truncate harmlessly. */
+#define JOURNAL_DIR  "/var/lib/protectme"
+#define JOURNAL_PATH JOURNAL_DIR "/identities.journal"
+#define JMAX 256
+
+struct jident { unsigned long dev, ino; char path[512]; };
+
+static struct jident g_journal[JMAX];
+static int g_jn;
+
+static void journal_load(void) {
+    FILE *f = fopen(JOURNAL_PATH, "r");
+    if (!f) return;
+    char line[1200], path[512];
+    unsigned long dev, ino, epoch, owner;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "REG %lu %lu %lu owner=%lu %511[^\n]",
+                   &epoch, &dev, &ino, &owner, path) != 5)
+            continue;
+        struct jident *j = NULL;
+        for (int i = 0; i < g_jn; i++)
+            if (!strcmp(g_journal[i].path, path)) { j = &g_journal[i]; break; }
+        if (!j && g_jn < JMAX) j = &g_journal[g_jn++];
+        if (j) {
+            j->dev = dev; j->ino = ino;
+            snprintf(j->path, sizeof(j->path), "%s", path);
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "identity: %d entr(y|ies) loaded\n", g_jn);
+}
+
+static struct jident *journal_find(const char *path) {
+    for (int i = 0; i < g_jn; i++)
+        if (!strcmp(g_journal[i].path, path))
+            return &g_journal[i];
+    return NULL;
+}
+
+static void journal_append(const char *path, unsigned long dev,
+                           unsigned long ino, unsigned long owner) {
+    struct jident *j = journal_find(path);
+    if (!j && g_jn < JMAX) {
+        j = &g_journal[g_jn++];
+        snprintf(j->path, sizeof(j->path), "%s", path);
+    }
+    if (j) { j->dev = dev; j->ino = ino; }
+    mkdir(JOURNAL_DIR, 0755); /* EEXIST fine */
+    FILE *f = fopen(JOURNAL_PATH, "a");
+    if (!f) return;
+    fprintf(f, "REG %ld %lu %lu owner=%lu %s\n",
+            (long)time(NULL), dev, ino, owner, path);
+    fclose(f);
+}
+
 /* Re-assert every policy object in the kernel maps. Called at startup and
  * on SIGHUP. Policy is the source of truth; kernel maps are runtime state.
  * Objects that cannot be stat'ed are SKIPPED LOUDLY (never silently). */
@@ -122,15 +185,32 @@ static int policy_reconcile(void) {
             skipped++;
             continue;
         }
+        /* identity classification against journal */
+        struct jident *j = journal_find(arg);
+        const char *how = "FRESH";
+        if (j) {
+            if (j->dev == (unsigned long)st.st_dev &&
+                j->ino == st.st_ino)
+                how = "REASSERT";
+            else {
+                how = "DRIFTED";
+                fprintf(stderr,
+                    "identity: WARNING %s now resolves to a DIFFERENT "
+                    "object: was (%lu,%lu) now (%lu,%lu)\n",
+                    arg, j->dev, j->ino,
+                    (unsigned long)st.st_dev, (unsigned long)st.st_ino);
+            }
+        }
         /* registration rides the same tracepoint pm-mark uses;
          * owner packed (uid<<32)|payload so policy-owned trees grant
          * capabilities to the right user, not to the loader */
         syscall(SYS_prctl, PM_INODE_SET_MAGIC,
                 (unsigned long)st.st_dev, (unsigned long)st.st_ino,
                 (unsigned long)(owner << 32 | 0xFEEDFACEul), 0);
-        fprintf(stderr, "policy: LOAD %-4s %s (%lu,%lu) owner=%lu\n",
-                type, arg, (unsigned long)st.st_dev,
+        fprintf(stderr, "policy: %-8s %-4s %s (%lu,%lu) owner=%lu\n",
+                how, type, arg, (unsigned long)st.st_dev,
                 (unsigned long)st.st_ino, owner);
+        journal_append(arg, st.st_dev, st.st_ino, owner);
         loaded++;
     }
     fclose(f);
@@ -360,6 +440,7 @@ int main(int argc, char **argv) {
 
     /* STATE-01: policy is the source of truth — reconcile at startup so a
      * daemon restart or reboot never silently disables protection */
+    journal_load();
     policy_reconcile();
 
     /* CAP-01E: capability issuer socket (root-only by fs perms).
