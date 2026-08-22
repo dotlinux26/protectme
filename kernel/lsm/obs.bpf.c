@@ -165,6 +165,7 @@ struct tx_file_cap {
     __u32 ino;
     __u32 owner_uid;
     __u32 binder_tgid;   /* 0 = unbound; first attach claims */
+    __u32 epoch;         /* P0.5: dead after any RVKE */
     __u64 expires_ns;
     void *f_inode;       /* reuse/ABA guard */
 };
@@ -176,8 +177,35 @@ struct {
     __type(value, struct tx_file_cap);
 } tx_by_file SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} cap_epoch SEC(".maps");
+
+static __always_inline __u32 epoch_get(void) {
+    __u32 key = 0, v = 0;
+    __u32 *p = bpf_map_lookup_elem(&cap_epoch, &key);
+    if (!p) {
+        bpf_map_update_elem(&cap_epoch, &key, &v, BPF_NOEXIST);
+        p = bpf_map_lookup_elem(&cap_epoch, &key);
+    }
+    return p ? *p : 0;
+}
+
+static __always_inline void epoch_bump(void) {
+    __u32 key = 0;
+    __u32 nv = epoch_get() + 1;
+    bpf_map_update_elem(&cap_epoch, &key, &nv, BPF_ANY);
+}
+
 #define PM_TX_REGFD_MAGIC 0x52454746u /* "REGF" — loader (root) registers its memfd */
 #define PM_TX_ATTFD_MAGIC 0x41544644u /* "ATFD" — holder presents fd number */
+#define PM_TX_REVOKE_MAGIC 0x52564B45u /* "RVKE" — bump cap epoch */
+/* P0.5: global capability epoch. REGF stamps the current epoch into every
+ * registered cap; ATTFD rejects stale epochs; RVKE bumps the epoch so ALL
+ * outstanding FD capabilities die instantly, O(1), no map iteration. */
 
 /* resolve current task's fd number to its struct file via fdtable.
  * Research-grade CORE walk; production should revisit (rcu details). */
@@ -306,6 +334,7 @@ int tp_enter_prctl(struct trace_event_raw_sys_enter *ctx) {
             .ino = (__u32)BPF_CORE_READ(ctx, args[3]),
             .owner_uid = (__u32)(dev_pack >> 32),
             .binder_tgid = 0,
+            .epoch = epoch_get(),
             .expires_ns = bpf_ktime_get_ns() + ttl_ms * 1000000ull,
             .f_inode = BPF_CORE_READ(f, f_inode),
         };
@@ -319,6 +348,8 @@ int tp_enter_prctl(struct trace_event_raw_sys_enter *ctx) {
         struct tx_file_cap *cap = bpf_map_lookup_elem(&tx_by_file, &f);
         if (!cap || cap->expires_ns <= bpf_ktime_get_ns())
             return 0;
+        if (cap->epoch != epoch_get())
+            return 0; /* P0.5: revoked by a later RVKE */
         void *cur_ino = BPF_CORE_READ(f, f_inode);
         if (cap->f_inode != cur_ino)
             return 0; /* struct file address reused by another object */
@@ -344,6 +375,13 @@ int tp_enter_prctl(struct trace_event_raw_sys_enter *ctx) {
         __u32 key = 0;
         __u32 val = (__u32)BPF_CORE_READ(ctx, args[1]);
         bpf_map_update_elem(&pm_mode, &key, &val, BPF_ANY);
+        return 0;
+    }
+    if (op == PM_TX_REVOKE_MAGIC) {
+        /* root only; global epoch bump — all outstanding FD caps die */
+        if ((bpf_get_current_uid_gid() & 0xFFFFFFFF) != 0)
+            return 0;
+        epoch_bump();
         return 0;
     }
     return 0;
@@ -693,6 +731,30 @@ __always_inline int pm_decide(const char *opname, __u32 oplen,
     e->verdict = v;
     bpf_ringbuf_submit(e, 0);
     return v;
+}
+
+SEC("lsm/path_rename")
+int BPF_PROG(lsm_path_rename, struct path *old_dir, struct dentry *old_dentry,
+             struct path *new_dir, struct dentry *new_dentry)
+{
+    /* P0.5: vfs_rename calls security_path_rename (NOT inode_rename) for
+     * local renames — this is the hook that actually sees mv(2).
+     * Classification:
+     *   source outside any root                     -> allow
+     *   source inside, destination same root        -> cls 1 (boundary op)
+     *   source inside, destination OUTSIDE/different-> cls 2 (destructive
+     *                                                  exfiltration) */
+    struct walk_result ws, wd;
+    nearest_root(old_dentry, &ws);
+    if (!ws.found)
+        return 0; /* nothing protected involved */
+    struct dentry *np = BPF_CORE_READ(new_dir, dentry);
+    nearest_root(np, &wd);
+    int crossing = !wd.found || wd.ino != ws.ino || wd.dev != ws.dev;
+    __u32 cls = (ws.depth == 0 || crossing) ? 2 : 1;
+    struct task_ctx tc;
+    marker_read(&tc);
+    return compute_verdict(mode_get(), cls, &ws, &tc);
 }
 
 SEC("lsm/inode_unlink")

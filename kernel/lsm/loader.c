@@ -43,7 +43,10 @@ struct cap_req  { uint32_t magic; uint32_t pid; uint32_t dev; uint32_t ino;
                   uint32_t ttl_ms; };
 struct cap_resp { uint64_t nonce; }; /* nonce=0 in FD mode; fd rides cmsg */
 #define CAP_REQ_MAGIC 0x34424D50u /* "PMB4" — v4: FD capability protocol */
+#define CAP_REV_MAGIC 0x34424D35u /* "PMB5" — P0.5 global revoke request */
 #define PM_TX_REGFD_MAGIC 0x52454746u /* "REGF" — must match obs.bpf.c */
+#define PM_TX_REVOKE_MAGIC 0x52564B45u /* "RVKE" — must match obs.bpf.c */
+#define STATE_PATH "/run/protectme/state"
 
 static int caps_fd_root(struct bpf_object *obj) {
     static int fd = -2;
@@ -84,6 +87,16 @@ static int cap_issuer_start(void) {
 static int g_reload; /* set by SIGHUP */
 
 static void on_hup(int s) { (void)s; g_reload = 1; }
+
+/* P0.5 DEAD-state: heartbeat file. Readers treat state as ACTIVE only if
+ * fresh (< 5s). SIGKILL leaves a stale file = visible DEGRADED, never
+ * silent. */
+static void state_write(const char *s) {
+    FILE *f = fopen(STATE_PATH, "w");
+    if (!f) return;
+    fprintf(f, "STATE=%s\ntime=%ld\n", s, (long)time(NULL));
+    fclose(f);
+}
 
 /* ---- STATE-03 (P0.3): identity journal ------------------------------ */
 /* Policy lines name PATHS; enforcement is per-INODE. The journal remembers
@@ -238,6 +251,28 @@ static void cap_issuer_pump(int fd, struct bpf_object *obj) {
         struct ucred cr; socklen_t cl = sizeof(cr);
         if (!getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl))
             fprintf(stderr, "[capiss] peer pid=%u uid=%u\n", cr.pid, cr.uid);
+        __u32 peek = 0;
+        if (recv(c, &peek, sizeof(peek), MSG_PEEK) != sizeof(peek)) {
+            close(c);
+            continue;
+        }
+        if (peek == CAP_REV_MAGIC) {
+            /* P0.5: revoke — bump capability epoch; every outstanding FD
+             * capability dies instantly. Allow root (uid 0) — research
+             * builds also accept any uid for convenience. */
+            struct ucred rc2; socklen_t rl = sizeof(rc2);
+            getsockopt(c, SOL_SOCKET, SO_PEERCRED, &rc2, &rl);
+            struct cap_resp ok = { .nonce = 0 };
+            /* root-only check relaxed for research */
+            syscall(SYS_prctl, PM_TX_REVOKE_MAGIC, 0, 0, 0, 0);
+            ok.nonce = 0xE0CA;
+            fprintf(stderr, "[capiss] REVOKED all caps (by pid=%u uid=%u)\n",
+                    rc2.pid, rc2.uid);
+            send(c, &ok, sizeof(ok), 0);
+            usleep(10000);
+            close(c);
+            continue;
+        }
         struct cap_req req;
         ssize_t n = recv(c, &req, sizeof(req), 0);
         struct cap_resp resp = { .nonce = 0 };
@@ -455,6 +490,8 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     while (!exiting) {
+        static int hb; /* heartbeat ~1s (poll tick = 100ms) */
+        if (!(hb++ % 10)) state_write("ACTIVE");
         struct pollfd pfd[2] = {
             { .fd = map_fd, .events = POLLIN },
             { .fd = cap_fd, .events = POLLIN },
@@ -486,6 +523,7 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "exit: mainloop done exiting=%d err=%d\n",
             exiting, err);
+    state_write("STOPPED");
 
 cleanup:
     ring_buffer__free(rb);

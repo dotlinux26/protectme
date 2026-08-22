@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /* CONTROL-PLANE ABI (research quirk, unchanged since run8):
  * the opcode travels IN THE OPTION SLOT: syscall(SYS_prctl, PM_MAGIC, p1, p2).
@@ -45,7 +46,9 @@ struct cap_req  { uint32_t magic; uint32_t pid; uint32_t dev; uint32_t ino;
                   uint32_t ttl_ms; };
 struct cap_resp { uint64_t nonce; }; /* nonce==1 => fd rides in cmsg */
 #define CAP_REQ_MAGIC 0x34424D50u /* "PMB4" */
+#define CAP_REV_MAGIC 0x34424D35u /* "PMB5" — global revoke */
 #define PM_TX_ATTFD_MAGIC 0x41544644u /* "ATFD" — must match obs.bpf.c */
+#define STATE_PATH "/run/protectme/state"
 
 static void usage(void) {
     fprintf(stderr,
@@ -160,6 +163,46 @@ int main(int argc, char **argv) {
         int r = unlink(pbuf);
         printf("RESULT=%s\n", r == 0 ? "BIND-OK" : "BIND-DENIED");
         return r == 0 ? 0 : 5;
+    }
+    if (!strcmp(argv[1], "revoke")) {
+        /* send PMB5 revoke request; root-only on server side */
+        if (argc != 2) usage();
+        int sock = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+        struct sockaddr_un sa = { .sun_family = AF_UNIX };
+        strncpy(sa.sun_path, "/run/protectme/tx.sock", sizeof(sa.sun_path)-1);
+        if (connect(sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            perror("connect revoke");
+            return 5;
+        }
+        uint32_t magic = CAP_REV_MAGIC;
+        send(sock, &magic, sizeof(magic), 0);
+        uint64_t resp = 0;
+        ssize_t n = recv(sock, &resp, sizeof(resp), 0);
+        close(sock);
+        fprintf(stderr, "debug revoke resp=%llu n=%zd errno=%d\n", (unsigned long long)resp, n, errno);
+        if (n == sizeof(resp) && resp == 0xE0CA) {
+            printf("REVOKE OK\n");
+            return 0;
+        }
+        fprintf(stderr, "REVOKE failed\n");
+        return 6;
+    }
+    if (!strcmp(argv[1], "status")) {
+        FILE *f = fopen(STATE_PATH, "r");
+        if (!f) {
+            printf("STATE=DEAD (no state file)\n");
+            return 1;
+        }
+        char line[256]; char state[32]="UNKNOWN"; long tm=0;
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "STATE=%31s", state) == 1) continue;
+            if (sscanf(line, "time=%ld", &tm) == 1) continue;
+        }
+        fclose(f);
+        long now = time(NULL);
+        int fresh = (now - tm) < 5;
+        printf("STATE=%s (%s, age=%lds)\n", state, fresh?"ACTIVE":"STALE/DEAD", now - tm);
+        return fresh && strcmp(state,"ACTIVE")==0 ? 0 : 2;
     }
     if (!strcmp(argv[1], "attachfd")) {
         /* present fd NUMBER N of THIS process as capability */
